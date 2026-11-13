@@ -1,0 +1,45 @@
+# doc-sentinel detect image. Runtime is meant to run with --network=none.
+# Build from the repository root (submodules initialised):
+#   docker build -f containers/Dockerfile.detect -t doc-sentinel-detect .
+# Prompt Guard 2 weights are NOT baked in (Llama license, gated on Hugging Face). Mount a
+# local Hugging Face cache read-only at /models (see compose.yaml).
+
+ARG RUST_VERSION=1.88
+ARG PYTHON_VERSION=3.12
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS chk_defaced
+WORKDIR /src
+COPY third_party/chk_defaced-rs/ ./
+# AGPL-3.0-only: built and shipped as a separate executable, never linked.
+RUN cargo build --release --locked && cp target/release/chk_defaced /chk_defaced
+
+FROM python:${PYTHON_VERSION}-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/models \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    DOC_SENTINEL_HOME=/opt/doc-sentinel
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl git tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng \
+       qpdf poppler-utils util-linux \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install "uv>=0.4"
+WORKDIR /opt/doc-sentinel
+COPY . .
+COPY --from=chk_defaced /chk_defaced /opt/doc-sentinel/bin/chk_defaced
+RUN uv pip install --system --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -e '.[detect,promptguard]' \
+        -e 'third_party/perlecta-mcp[rendu]' \
+        -e third_party/unicode-smuggling-guard \
+        -e third_party/PurpleLlama/LlamaFirewall \
+    && (cd third_party/subtext-scan && npm ci --ignore-scripts --no-audit --no-fund)
+RUN useradd --create-home sentinel
+USER sentinel
+WORKDIR /work
+ENTRYPOINT ["doc-sentinel"]
+CMD ["--help"]
