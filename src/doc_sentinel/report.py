@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -119,9 +121,31 @@ def to_human_summary(report: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def same_file(a: Path, b: Path) -> bool:
+    """True when both paths name the same file, including symlink and hardlink aliases."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return a.resolve() == b.resolve()
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write via a temp file + rename: an existing path is replaced as a directory entry,
+    never written through its inode (so a hardlink alias of another file is not modified)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def write_report(report: dict[str, Any], path: Path) -> None:
     if path.suffix.lower() in (".md", ".markdown"):
-        path.write_text(to_markdown(report), encoding="utf-8")
+        text = to_markdown(report)
     else:
-        path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-                        encoding="utf-8")
+        text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_bytes(path, text.encode("utf-8"))

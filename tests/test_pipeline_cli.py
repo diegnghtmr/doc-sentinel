@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -234,3 +235,86 @@ def test_detect_subprocess_has_no_network(tmp_path):
             "except OSError: print('NONET')")
     cp = run_tool(["python3", "-c", code], ctx)
     assert cp.stdout.strip() == "NONET"
+
+
+def test_clean_refuses_hardlink_to_input_even_with_force(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    alias = tmp_path / "alias.txt"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["clean", str(docx), "-o", str(alias), "--force-output"], capsys)
+    assert code == 2 and "input" in err
+    assert sha(docx) == before
+
+
+def test_detect_refuses_report_hardlinked_to_input(fake_registry, docx, capsys, tmp_path):
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    alias = tmp_path / "alias.json"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["detect", str(docx), "--report", str(alias)], capsys)
+    assert code == 2 and "report" in err
+    assert sha(docx) == before
+
+
+def test_clean_refuses_report_hardlinked_to_input(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    alias = tmp_path / "alias.json"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["clean", str(docx), "--report", str(alias)], capsys)
+    assert code == 2 and "report" in err
+    assert sha(docx) == before
+
+
+def test_force_output_replaces_file_without_writing_through_its_inode(
+        fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    dest = tmp_path / "out.txt"
+    dest.write_bytes(b"old")
+    other = tmp_path / "other-name.txt"
+    os.link(dest, other)  # unrelated hardlink to the old output must keep its content
+    code, _, _ = run(["clean", str(docx), "-o", str(dest), "--force-output"], capsys)
+    assert code == 0 and dest.read_bytes() == b"CLEAN" and other.read_bytes() == b"old"
+
+
+def test_run_tool_fails_closed_without_network_isolation(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.delenv("DOC_SENTINEL_NO_NETNS", raising=False)
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="network isolation"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+def test_run_tool_trusts_declared_external_isolation(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")  # e.g. container with --network=none
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    assert base.run_tool(["python3", "-c", "print('ran')"], ctx).stdout.strip() == "ran"
+
+
+def test_run_tool_allow_network_needs_no_sandbox(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.delenv("DOC_SENTINEL_NO_NETNS", raising=False)
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=True)
+    assert base.run_tool(["python3", "-c", "print('ran')"], ctx).stdout.strip() == "ran"
+
+
+def test_channel_extraction_failure_never_yields_clean(fake_registry, docx, capsys, monkeypatch):
+    from doc_sentinel import pipeline
+
+    def boom(src, dtype):
+        raise ValueError("part exceeds size limit")
+
+    monkeypatch.setattr(pipeline, "extract_channels", boom)
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, out, _ = run(["detect", str(docx), "--json"], capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"]) == (2, "error")
+    assert any(f["id"] == "channel-extract" and "size limit" in f["reason"]
+               for f in data["adapters_failed"])

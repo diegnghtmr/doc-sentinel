@@ -15,7 +15,7 @@ from doc_sentinel.adapters.base import repo_root
 from doc_sentinel.intents import classify
 from doc_sentinel.pins import checkout_sha, load_lock
 from doc_sentinel.pipeline import UsageError, run_clean, run_detect
-from doc_sentinel.report import to_human_summary, write_report
+from doc_sentinel.report import same_file, to_human_summary, write_report
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             print(mode)
             return 0
         if args.command == "detect":
-            if args.report and args.report.resolve() == args.file.resolve():
+            if args.report and same_file(args.report, args.file):
                 raise UsageError("report path must differ from the input document")
             report, code = run_detect(args.file, allow_network=args.allow_network,
                                       fail_on=args.fail_on)
