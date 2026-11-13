@@ -15,7 +15,7 @@ from doc_sentinel.adapters.base import repo_root
 from doc_sentinel.intents import classify
 from doc_sentinel.pins import checkout_sha, load_lock
 from doc_sentinel.pipeline import UsageError, run_clean, run_detect
-from doc_sentinel.report import same_file, to_human_summary, write_report
+from doc_sentinel.report import UnsafePathError, same_file, to_human_summary, write_report
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -60,7 +60,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _emit(report: dict, args: argparse.Namespace) -> None:
     if args.report:
-        write_report(report, args.report)
+        protect = [Path(report["input"]["path"])]
+        if report.get("output_path"):
+            protect.append(Path(report["output_path"]))
+        write_report(report, args.report, protect=protect)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         print(to_human_summary(report), file=sys.stderr)
@@ -117,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
                 for item in result.get("pins", []):
                     print(f"{item['id']}: {item['status']}")
             return code
+    except UnsafePathError as exc:
+        print(f"doc-sentinel: unsafe write refused: {exc}", file=sys.stderr)
+        return 2
     except UsageError as exc:
         print(f"doc-sentinel: {exc}", file=sys.stderr)
         return 2

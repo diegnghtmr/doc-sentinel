@@ -168,7 +168,7 @@ def run_clean(src: Path, *, output: Path | None = None, force_output: bool = Fal
                                           if a.get("c2pa")]
             current = out
         if not tool_failed:
-            atomic_write_bytes(dest, current.read_bytes())
+            atomic_write_bytes(dest, current.read_bytes(), protect=[src])
             report["output_path"] = str(dest)
 
     if sha256_file(src) != original_sha:

@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
+import secrets
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -129,23 +130,90 @@ def same_file(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write via a temp file + rename: an existing path is replaced as a directory entry,
-    never written through its inode (so a hardlink alias of another file is not modified)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+class UnsafePathError(OSError):
+    """A write target resolves to a protected file or its directory changed under us."""
+
+
+def _open_dir_nofollow(directory: Path) -> int:
+    """Open ``directory`` walking its resolved components with O_NOFOLLOW.
+
+    The path is resolved once; if any component is later swapped for a symlink (directory
+    rebinding after validation), opening it fails instead of following the new link.
+    """
+    resolved = directory.resolve()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, path)
+        for part in resolved.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                raise UnsafePathError(f"unsafe directory component {part!r} in {resolved}: "
+                                      f"{exc.strerror}") from exc
+            os.close(fd)
+            fd = child
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        os.close(fd)
         raise
+    return fd
 
 
-def write_report(report: dict[str, Any], path: Path) -> None:
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def atomic_write_bytes(path: Path, data: bytes, protect: Sequence[Path] = ()) -> None:
+    """Write ``data`` to ``path`` via a temp file + rename inside a pinned directory fd.
+
+    An existing ``path`` is replaced as a directory entry, never written through its inode,
+    and the write is refused when the final entry is (or the directory now holds, under the
+    same name) one of the ``protect``ed files, e.g. the input document.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    protected = {i for i in (_identity(p) for p in protect) if i is not None}
+    protected_entries = set()
+    for item in protect:
+        parent = _identity(item.parent)
+        if parent is not None:
+            protected_entries.add((parent, item.name))
+    dir_fd = _open_dir_nofollow(path.parent)
+    name = path.name
+    tmp = f".{name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    try:
+        dir_st = os.fstat(dir_fd)
+        if ((dir_st.st_dev, dir_st.st_ino), name) in protected_entries:
+            raise UnsafePathError(f"refusing to replace a protected file: {path}")
+        try:
+            current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (current.st_dev, current.st_ino) in protected:
+            raise UnsafePathError(f"refusing to replace a protected file: {path}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | getattr(os, "O_CLOEXEC", 0), 0o666, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
+
+
+def write_report(report: dict[str, Any], path: Path, protect: Sequence[Path] = ()) -> None:
     if path.suffix.lower() in (".md", ".markdown"):
         text = to_markdown(report)
     else:
         text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
-    atomic_write_bytes(path, text.encode("utf-8"))
+    atomic_write_bytes(path, text.encode("utf-8"), protect=protect)

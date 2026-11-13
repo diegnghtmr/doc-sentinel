@@ -318,3 +318,59 @@ def test_channel_extraction_failure_never_yields_clean(fake_registry, docx, caps
     assert (code, data["verdict"]) == (2, "error")
     assert any(f["id"] == "channel-extract" and "size limit" in f["reason"]
                for f in data["adapters_failed"])
+
+
+def _rebind(out_dir: Path, target_dir: Path) -> None:
+    """Swap a validated output directory for a symlink to another directory (TOCTOU race)."""
+    out_dir.rename(out_dir.with_name(out_dir.name + "-old"))
+    out_dir.symlink_to(target_dir, target_is_directory=True)
+
+
+class RebindingCleaner(FakeCleaner):
+    def __init__(self, out_dir, target_dir):
+        super().__init__("watermarks-remover")
+        self.out_dir, self.target_dir = out_dir, target_dir
+
+    def clean(self, src, dest, ctx):
+        result = super().clean(src, dest, ctx)
+        _rebind(self.out_dir, self.target_dir)
+        return result
+
+
+class RebindingDetect(FakeDetect):
+    def __init__(self, out_dir, target_dir):
+        super().__init__("perlecta")
+        self.out_dir, self.target_dir = out_dir, target_dir
+
+    def inspect(self, src, ctx):
+        _rebind(self.out_dir, self.target_dir)
+        return []
+
+
+@pytest.fixture
+def raced(tmp_path):
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    src = in_dir / "doc.txt"
+    src.write_text("hola\u200bmundo", encoding="utf-8")
+    return src, in_dir, out_dir
+
+
+def test_clean_output_dir_rebinding_cannot_overwrite_original(fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    fake_registry["clean"] = [RebindingCleaner(out_dir, in_dir)]
+    before = sha(src)
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / "doc.txt")], capsys)
+    assert sha(src) == before
+    assert code == 2
+
+
+def test_detect_report_dir_rebinding_cannot_overwrite_original(fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    fake_registry["detect"] = [RebindingDetect(out_dir, in_dir)]
+    fake_registry["mandatory"] = {"perlecta"}
+    before = sha(src)
+    code, _, _ = run(["detect", str(src), "--report", str(out_dir / "doc.txt")], capsys)
+    assert sha(src) == before
+    assert code == 2
