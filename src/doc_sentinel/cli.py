@@ -72,9 +72,11 @@ def _pin_report(args: argparse.Namespace) -> PinnedTarget | None:
     protect = [args.file]
     if args.command == "clean":
         protect.append(args.output or default_output(args.file))
+    what = ("the input and the output document" if args.command == "clean"
+            else "the input document")
     for item in protect:
         if same_file(args.report, item):
-            raise UsageError("report path must differ from the input and the output document")
+            raise UsageError(f"report path must differ from {what}")
     return pin_target(args.report, protect=protect)
 
 

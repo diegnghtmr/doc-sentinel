@@ -474,3 +474,17 @@ def test_rebinding_matrix(fake_registry, tmp_path, capsys, mode, ancestor, colli
     assert sha(src) == before
     assert not list(tmp_path.rglob("*.tmp"))
     assert code == 2 and "unsafe write refused" in err
+
+
+@pytest.mark.parametrize("alias", ["same", "hardlink", "symlink"])
+def test_detect_report_alias_preserves_error_text(docx, tmp_path, capsys, alias):
+    before = sha(docx)
+    target = docx if alias == "same" else tmp_path / "alias.txt"
+    if alias == "hardlink":
+        os.link(docx, target)
+    elif alias == "symlink":
+        target.symlink_to(docx)
+    code, out, err = run(["detect", str(docx), "--report", str(target)], capsys)
+    assert code == 2 and out == ""
+    assert err == "doc-sentinel: report path must differ from the input document\n"
+    assert sha(docx) == before
