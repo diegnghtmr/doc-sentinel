@@ -35,9 +35,9 @@ Source of design truth: `PLAN.md` (13 Nov 2026). This document holds the specs, 
 | T5 | S4 | worker | done | 7367c4e |
 | T6 | S4 | worker | done (PG2 inference unverified: model not cached) | 8fe5d4c |
 | T7 | S7 | worker + parent test_pins fix | done | 3fd73e0 |
-| T8 | S9 | inline (corpus generator + manifest + corpus tests) | pending | — |
-| T9 | S11 | inline | done (containers/CI written; image build not run) | 7367c4e |
-| T10 | S10 | inline (end-to-end experiments on the samples, findings recorded in Log) | pending | — |
+| T8 | S9 | worker | done | (this commit) |
+| T9 | S11 | inline | done (image build not run) | 7367c4e, 3ec0e1f |
+| T10 | S10 | inline | done for clean (5 samples) and detect ej1/ej2; Prompt Guard pending model | L12, L13 |
 
 ## Log
 
@@ -66,4 +66,5 @@ Source of design truth: `PLAN.md` (13 Nov 2026). This document holds the specs, 
   - Visible body text naming "ChatGPT/Claude/Gemini" is content, not a trace: never removed.
 - **L12 (evidence, T5/T6 workers + parent spot check):** adapters on samples — ej1: perlecta 4 high, htd 4 high (native CRITICAL mapped to high: concealment alone is not proof of injection), subtext 4 medium, chk_defaced 1 (dedup); ej2: perlecta 4, htd 6, subtext 4, chk 1; ej3: only perlecta `DETECTEURS_IGNORES` tool_error/info (not substantive). `detect` CLI: ej1/ej2 verdict `findings` exit 1; sample_ai.xlsx/pptx `findings` exit 0 (unicode medium only). Prompt Guard skipped (model not cached). Parent fix: chk_defaced passes `src.resolve()` (relative path vs child cwd). Known gaps: OCR failures/20-image cap are skipped silently (no diagnostics channel yet). Commit slices exceeded ~400 lines because T3–T6 landed as cohesive per-layer units; accepted, recorded here.
 - **L13 (evidence, T10 clean on the 5 watermark samples, parent run in /tmp copies):** every `doc-sentinel clean` exit 0 verdict `cleaned`, originals SHA-256 unchanged. Actions: ej3 → WMR scrubbed creator/lastModifiedBy/subject/Application, dropped customXml, PNG tEXt; glue removed 3 orphan styles (o00408, s01997, first-table-reference) + 290 divs. docx-js → creator/lastModifiedBy `Un-named` scrubbed by WMR clean (its inspect did not flag it, its clean does). python-docx → creator/description/Application, customXml, U+202F replaced; glue removed 2013 template dates + default thumbnail. pptx → creator/Application, JPEG APP11 C2PA removed (c2pa true→false), U+200D removed. xlsx → creator/lastModifiedBy/description/Application/Company, custom.xml (AIModel), PNG C2PA tEXt (true→false), U+200B removed. Independent stdlib scan of outputs: no AI metadata, no C2PA/JUMBF/EXIF/XMP in media, no invisible Unicode. WMR re-inspect of outputs: has_c2pa=false, has_ai_metadata=false, no Layer A. LibreOffice→PDF→pdftotext: visible text identical and same page count for all 5. Warnings: exiftool/c2patool absent.
+- **L14 (evidence, T8 corpus + final suite):** 40 generated fixtures (no binaries). Corpus: adversarial 21 pass / 7 skip; clean controls 7/0/0; clean fixtures 5/0/0; full detect-verdict checks 1 pass / 34 skip (they skip because mandatory `prompt-guard` is not cached — not vacuous passes). Full suite: 229 passed, 42 skipped; ruff clean.
 - **L5 (decisions taken by the orchestrator under PLAN §18 open items, reversible):** parent license MIT; `detect --fail-on` default `high` (PLAN §9 default); PurpleLlama as full submodule with sparse checkout of `LlamaFirewall/` in the working tree; chk_defaced built locally with cargo and optional (`extra`) in containers; Python 3.12 venv via `uv`; user samples (contain personal names and student codes) are **not committed** (git-ignored), experiments reference them by path.
