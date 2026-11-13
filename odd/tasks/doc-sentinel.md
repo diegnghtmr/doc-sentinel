@@ -35,7 +35,7 @@ Source of design truth: `PLAN.md` (13 Nov 2026). This document holds the specs, 
 | T5 | S4 | worker | done | 7367c4e |
 | T6 | S4 | worker | done (PG2 inference unverified: model not cached) | 8fe5d4c |
 | T7 | S7 | worker + parent test_pins fix | done | 3fd73e0 |
-| T8 | S9 | worker | done | (this commit) |
+| T8 | S9 | worker | done | 20e4f8c |
 | T9 | S11 | inline | done (image build not run) | 7367c4e, 3ec0e1f |
 | T10 | S10 | inline | done for clean (5 samples) and detect ej1/ej2; Prompt Guard pending model | L12, L13 |
 
