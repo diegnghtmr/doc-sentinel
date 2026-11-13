@@ -22,8 +22,11 @@ doc-sentinel intent "<natural-language request>"   # -> clean | detect | update 
 Guarantees: the input is never modified (`clean` writes `<stem>.cleaned<suffix>` or `-o`,
 refuses the input path and existing files without `--force-output`); reports are only written
 outside the document; the verdict comes from a deterministic aggregator, never from an agent;
-`detect` runs offline (scrubbed environment, `HF_HUB_OFFLINE=1`, and an empty network namespace
-via `unshare -rn` when available).
+`detect` runs offline: scrubbed environment, `HF_HUB_OFFLINE=1`, and every sub-harness process in
+an empty network namespace (`unshare -rn`). If that namespace cannot be created, offline steps
+**fail closed** (adapter error, never `clean`) unless isolation is declared external with
+`DOC_SENTINEL_NO_NETNS=1` (as the containers do, since they run with `--network=none`).
+If channel extraction fails (e.g. an archive part over the size limit), the verdict is `error`.
 
 ## Sub-harnesses
 

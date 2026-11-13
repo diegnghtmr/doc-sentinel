@@ -94,7 +94,7 @@ def venv_bin(name: str) -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def network_sandbox_available() -> bool:
-    if os.environ.get("DOC_SENTINEL_NO_NETNS") == "1" or shutil.which("unshare") is None:
+    if shutil.which("unshare") is None:
         return False
     try:
         probe = subprocess.run(["unshare", "-rn", "true"], capture_output=True, timeout=10,
@@ -129,8 +129,16 @@ def run_tool(cmd: Sequence[str], ctx: RunContext, *, cwd: Path | None = None,
     find something, so adapters decide).
     """
     argv = [str(c) for c in cmd]
-    if not ctx.allow_network and network_sandbox_available():
-        argv = ["unshare", "-rn", "--", *argv]
+    if not ctx.allow_network:
+        if os.environ.get("DOC_SENTINEL_NO_NETNS") == "1":
+            pass  # isolation is declared external (e.g. container with --network=none)
+        elif network_sandbox_available():
+            argv = ["unshare", "-rn", "--", *argv]
+        else:
+            # Fail closed: never run an offline step with network access.
+            raise AdapterError(
+                "network isolation unavailable (unshare -rn failed); run inside a container "
+                "with --network=none and DOC_SENTINEL_NO_NETNS=1, or pass --allow-network")
     ctx.log("run: " + " ".join(argv))
     try:
         proc = subprocess.run(argv, cwd=str(cwd or ctx.workdir), env=child_env(ctx, extra_env),

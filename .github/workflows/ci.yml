@@ -52,6 +52,8 @@ jobs:
         with:
           toolchain: "1.88"
       - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa qpdf poppler-utils
+      - name: Allow unprivileged user namespaces (detect sandbox uses unshare -rn)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: |
           pip install uv
           uv pip install --system --index-strategy unsafe-best-match \
