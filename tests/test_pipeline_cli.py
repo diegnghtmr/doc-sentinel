@@ -488,3 +488,23 @@ def test_detect_report_alias_preserves_error_text(docx, tmp_path, capsys, alias)
     assert code == 2 and out == ""
     assert err == "doc-sentinel: report path must differ from the input document\n"
     assert sha(docx) == before
+
+
+@pytest.mark.parametrize("alias", ["same", "hardlink", "symlink"])
+@pytest.mark.parametrize("protected", ["input", "output"])
+def test_clean_report_alias_preserves_exact_error(
+        docx, tmp_path, capsys, alias, protected):
+    output = tmp_path / "output.txt"
+    output.write_bytes(b"KEEP OUTPUT")
+    before = sha(docx), sha(output)
+    original = docx if protected == "input" else output
+    target = original if alias == "same" else tmp_path / "alias.json"
+    if alias == "hardlink":
+        os.link(original, target)
+    elif alias == "symlink":
+        target.symlink_to(original)
+    code, out, err = run(["clean", str(docx), "-o", str(output),
+                          "--force-output", "--report", str(target)], capsys)
+    assert (code, out, err) == (
+        2, "", "doc-sentinel: report path must differ from the input and the output document\n")
+    assert (sha(docx), sha(output)) == before
