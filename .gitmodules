@@ -1,0 +1,29 @@
+[submodule "third_party/watermarks-remover"]
+	path = third_party/watermarks-remover
+	url = https://github.com/guillaumemeyer/watermarks-remover.git
+	branch = main
+[submodule "third_party/perlecta-mcp"]
+	path = third_party/perlecta-mcp
+	url = https://github.com/InstaClaim-AI/perlecta-mcp.git
+	branch = main
+[submodule "third_party/hidden-text-detector"]
+	path = third_party/hidden-text-detector
+	url = https://github.com/wppoland/hidden-text-detector.git
+	branch = main
+[submodule "third_party/subtext-scan"]
+	path = third_party/subtext-scan
+	url = https://github.com/shmindmaster/subtext-scan.git
+	branch = main
+[submodule "third_party/chk_defaced-rs"]
+	path = third_party/chk_defaced-rs
+	url = https://github.com/dariofinardi/chk_defaced-rs.git
+	branch = main
+[submodule "third_party/unicode-smuggling-guard"]
+	path = third_party/unicode-smuggling-guard
+	url = https://github.com/raulkivi/unicode-smuggling-guard.git
+	branch = main
+[submodule "third_party/PurpleLlama"]
+	path = third_party/PurpleLlama
+	url = https://github.com/meta-llama/PurpleLlama.git
+	shallow = true
+	branch = main

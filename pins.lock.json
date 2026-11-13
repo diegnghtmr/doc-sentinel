@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "branch_policy": "main-or-default",
+  "pins": [
+    {
+      "id": "watermarks-remover",
+      "url": "https://github.com/guillaumemeyer/watermarks-remover.git",
+      "branch": "main",
+      "sha": "5a62be6338d2812372b1da440e55c82922f97d53",
+      "path": "third_party/watermarks-remover",
+      "license": "MIT",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "perlecta-mcp",
+      "url": "https://github.com/InstaClaim-AI/perlecta-mcp.git",
+      "branch": "main",
+      "sha": "478d8061304c67798a3f9fee4b59f08594c1e003",
+      "path": "third_party/perlecta-mcp",
+      "license": "Apache-2.0",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "hidden-text-detector",
+      "url": "https://github.com/wppoland/hidden-text-detector.git",
+      "branch": "main",
+      "sha": "ce9e505dc1c128701e921e8d7e1a133c7ff28db8",
+      "path": "third_party/hidden-text-detector",
+      "license": "MIT",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "subtext-scan",
+      "url": "https://github.com/shmindmaster/subtext-scan.git",
+      "branch": "main",
+      "sha": "c237a68b4498dfc29cec0a5b1370f4b7b2743ba7",
+      "path": "third_party/subtext-scan",
+      "license": "Apache-2.0",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "chk_defaced-rs",
+      "url": "https://github.com/dariofinardi/chk_defaced-rs.git",
+      "branch": "main",
+      "sha": "d7a4b0998b564dc4a34c84bc88622aaaa105251f",
+      "path": "third_party/chk_defaced-rs",
+      "license": "AGPL-3.0-only",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "unicode-smuggling-guard",
+      "url": "https://github.com/raulkivi/unicode-smuggling-guard.git",
+      "branch": "main",
+      "sha": "0cedc4743f77a9d1f7fe94fa99571efb968ba401",
+      "path": "third_party/unicode-smuggling-guard",
+      "license": "MIT",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    },
+    {
+      "id": "PurpleLlama",
+      "url": "https://github.com/meta-llama/PurpleLlama.git",
+      "branch": "main",
+      "sha": "0654501399e7cbd560db9501965dc09c567a5563",
+      "path": "third_party/PurpleLlama",
+      "license": "LlamaFirewall: MIT; monorepo root: Llama Community License",
+      "inspected_at": "2026-11-13T17:01:00-05:00"
+    }
+  ]
+}
