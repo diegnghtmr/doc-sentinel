@@ -374,3 +374,103 @@ def test_detect_report_dir_rebinding_cannot_overwrite_original(fake_registry, ra
     code, _, _ = run(["detect", str(src), "--report", str(out_dir / "doc.txt")], capsys)
     assert sha(src) == before
     assert code == 2
+
+
+def test_clean_output_and_report_are_private_files(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    old = os.umask(0o022)
+    try:
+        out, rep = tmp_path / "o.txt", tmp_path / "r.json"
+        code, _, _ = run(["clean", str(docx), "-o", str(out), "--report", str(rep)], capsys)
+    finally:
+        os.umask(old)
+    assert code == 0
+    assert out.stat().st_mode & 0o077 == 0 and rep.stat().st_mode & 0o077 == 0
+
+
+def test_clean_output_dir_rebound_elsewhere_is_refused(fake_registry, raced, capsys, tmp_path):
+    src, _, out_dir = raced
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    fake_registry["clean"] = [RebindingCleaner(out_dir, elsewhere)]
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / "x.txt")], capsys)
+    assert code == 2 and list(elsewhere.iterdir()) == []
+
+
+def test_detect_report_dir_rebound_elsewhere_is_refused(fake_registry, raced, capsys, tmp_path):
+    src, _, out_dir = raced
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    fake_registry["detect"] = [RebindingDetect(out_dir, elsewhere)]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, _, _ = run(["detect", str(src), "--report", str(out_dir / "r.json")], capsys)
+    assert code == 2 and list(elsewhere.iterdir()) == []
+
+
+class MovingInputCleaner(FakeCleaner):
+    """Moves the input's directory away, then rebinds the output dir onto it."""
+
+    def __init__(self, in_dir, out_dir):
+        super().__init__("watermarks-remover")
+        self.in_dir, self.out_dir = in_dir, out_dir
+
+    def clean(self, src, dest, ctx):
+        result = super().clean(src, dest, ctx)
+        saved = self.in_dir.with_name("saved-input")
+        self.in_dir.rename(saved)
+        _rebind(self.out_dir, saved)
+        return result
+
+
+def test_moved_input_dir_cannot_be_overwritten_through_rebound_output(
+        fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    before = sha(src)
+    fake_registry["clean"] = [MovingInputCleaner(in_dir, out_dir)]
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / src.name)], capsys)
+    saved = in_dir.with_name("saved-input") / src.name
+    assert sha(saved) == before
+    assert code == 2
+
+
+@pytest.mark.parametrize("mode", ["clean", "detect"])
+def test_private_outputs_keep_baseline_permissions(fake_registry, docx, capsys, tmp_path, mode):
+    """S2/S3/S4: writes must not broaden the baseline's private permissions."""
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    docx.chmod(0o600)
+    old_umask = os.umask(0o022)
+    report = tmp_path / "report.json"
+    before = sha(docx)
+    try:
+        code, _, _ = run([mode, str(docx), "--report", str(report)], capsys)
+    finally:
+        os.umask(old_umask)
+    assert code == 0 and sha(docx) == before
+    targets = [report] + ([docx.with_name("in.cleaned.txt")] if mode == "clean" else [])
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in targets)
+
+
+@pytest.mark.parametrize("mode", ["clean-output", "clean-report", "detect-report"])
+@pytest.mark.parametrize("ancestor", [False, True])
+@pytest.mark.parametrize("collision", [False, True])
+def test_rebinding_matrix(fake_registry, tmp_path, capsys, mode, ancestor, collision):
+    """S2/S3/S4: late leaf/ancestor symlinks must be refused, not followed."""
+    inp, out = tmp_path / "in" / "child", tmp_path / "out" / "child"
+    inp.mkdir(parents=True)
+    out.mkdir(parents=True)
+    src = inp / "doc.txt"
+    src.write_bytes(b"ORIGINAL")
+    before = sha(src)
+    changed, target = (out.parent, inp.parent) if ancestor else (out, inp)
+    fake_registry["clean"] = [RebindingCleaner(changed, target)]
+    fake_registry["detect"] = [RebindingDetect(changed, target)]
+    fake_registry["mandatory"] = {"perlecta"}
+    argv = ["detect" if mode == "detect-report" else "clean", str(src)]
+    argv += ["-o" if mode == "clean-output" else "--report",
+             str(out / ("doc.txt" if collision else "unrelated.txt"))]
+    code, _, err = run(argv, capsys)
+    assert sha(src) == before
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert code == 2 and "unsafe write refused" in err

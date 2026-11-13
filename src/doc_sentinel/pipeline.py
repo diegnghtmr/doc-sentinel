@@ -13,7 +13,13 @@ from doc_sentinel.adapters.base import RunContext
 from doc_sentinel.aggregate import aggregate_detect, decide_clean
 from doc_sentinel.extract import extract_channels
 from doc_sentinel.formats import detect_type
-from doc_sentinel.report import atomic_write_bytes, new_report, same_file, sha256_file
+from doc_sentinel.report import (
+    atomic_write_bytes,
+    new_report,
+    pin_target,
+    same_file,
+    sha256_file,
+)
 from doc_sentinel.schema import AdapterOutcome, Channel, Finding
 
 
@@ -127,6 +133,7 @@ def run_clean(src: Path, *, output: Path | None = None, force_output: bool = Fal
         raise UsageError("report path must differ from the input and the output document")
     if dest.exists() and not force_output:
         raise UsageError(f"output exists: {dest} (use --force-output to replace it)")
+    target = pin_target(dest, protect=[src])
     dtype = detect_type(src)
     chain = registry.clean_chain(dtype)
     if not chain:
@@ -168,7 +175,7 @@ def run_clean(src: Path, *, output: Path | None = None, force_output: bool = Fal
                                           if a.get("c2pa")]
             current = out
         if not tool_failed:
-            atomic_write_bytes(dest, current.read_bytes(), protect=[src])
+            atomic_write_bytes(target, current.read_bytes())
             report["output_path"] = str(dest)
 
     if sha256_file(src) != original_sha:
