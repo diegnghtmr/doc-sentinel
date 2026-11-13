@@ -1,0 +1,19 @@
+# User-provided sample documents (contain personal data) — never commit
+/*.docx
+/samples/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+# Outputs
+*.cleaned.*
+/reports/
+/.cache/
+/tests/corpus/generated/
+# Local tool builds
+/bin/
