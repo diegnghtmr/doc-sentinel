@@ -121,12 +121,59 @@ default ES/EN rules work without it; both rules and classifier can miss attacks.
 
 ## Containers
 
+One image, `doc-sentinel:local` (`containers/Dockerfile`, about 1.5 GB), holds the complete
+harness: every pinned sub-harness, chk_defaced as a separate binary, Tesseract (spa/eng), qpdf,
+exiftool, c2patool and headless LibreOffice (needed by the DOCX/PDF sanitize render checks).
+It never contains your documents (`.dockerignore`) and runs as uid 10001 with no network,
+a read-only root, `/tmp` as tmpfs, all capabilities dropped and `no-new-privileges`.
+
+The launchers build the image on first use and pass the same arguments as the CLI:
+
+```bash
+scripts/doc-sentinel-docker.sh detect inbox/file.pdf --agent-summary --report reports/file.json
+scripts/doc-sentinel-docker.sh clean  inbox/file.docx -o reports/file.cleaned.docx
+scripts/doc-sentinel-docker.sh detect inbox/file.docx --sanitize --report reports/file.json
+```
+
+The input's folder is mounted read-only; outputs, reports and review directories are mounted
+read-write separately. `update` and `--allow-network` are refused inside the container: run
+`update` from a git checkout with the host CLI.
+
+### Windows 11 (Docker Desktop)
+
+`detect` cannot run natively on Windows (it needs Linux network namespaces and Perlecta's POSIX
+confinement), so on Windows doc-sentinel always runs in the container.
+
+1. Install Docker Desktop (`winget install -e --id Docker.DockerDesktop`) and keep it in
+   **Linux containers** mode (the default).
+2. Clone with submodules: `git clone --recursive <repo>` (or
+   `git submodule update --init --recursive` in an existing clone).
+3. From the repository folder, in PowerShell or `cmd`:
+
+   ```powershell
+   .\scripts\doc-sentinel.cmd detect "C:\Users\you\Documents\exam.docx" --agent-summary --report "C:\Users\you\Documents\exam.report.json"
+   .\scripts\doc-sentinel.cmd detect "C:\Users\you\Documents\exam.docx" --sanitize
+   .\scripts\doc-sentinel.cmd clean  "C:\Users\you\Documents\exam.docx"
+   ```
+
+The launcher detects Windows 11 (build 22000 or later; older builds get a warning), starts
+Docker Desktop and waits for it when it is not running, refuses Windows-containers mode, builds
+the image the first time (several minutes, needs internet once), validates on the host that the
+output and report are not the input, and maps your folders to the container mounts. Output and
+report folders must already exist. Paths with spaces and accents are supported. Exit codes and
+JSON output are passed through unchanged, so coding agents (Claude Code, Codex, Copilot, ...)
+follow the same `AGENTS.md` flow on Windows.
+
+Status: the PowerShell launcher is tested on Linux PowerShell with a simulated `docker`; the
+Windows-specific branches (build detection, Docker Desktop start, drive-letter paths) are
+simulated and still need a run on a real Windows 11 machine.
+
+`containers/compose.yaml` offers the same hardening for manual use:
+
 ```bash
 docker compose -f containers/compose.yaml run --rm detect detect /work/in/file.pdf --json
 docker compose -f containers/compose.yaml run --rm clean  clean  /work/in/file.pdf -o /work/out/file.cleaned.pdf
 ```
-
-Both services run with `network_mode: none`; inputs are mounted read-only.
 
 ## Known gaps (not covered, by design or by the pinned tools)
 
