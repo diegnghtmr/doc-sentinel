@@ -130,6 +130,9 @@ def child_env(ctx: RunContext, extra: dict[str, str] | None = None) -> dict[str,
     env["HOME"] = str(ctx.workdir)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # PyMuPDF writes notices (e.g. the 'fitz API is deprecated' warning) to stdout by
+    # default, which corrupts sub-harness JSON reports; send them to stderr instead.
+    env["PYMUPDF_MESSAGE"] = "fd:2"
     if not ctx.allow_network:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"

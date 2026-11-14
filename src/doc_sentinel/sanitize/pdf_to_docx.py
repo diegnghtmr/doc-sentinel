@@ -21,7 +21,10 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 import pikepdf
-import pymupdf
+
+from doc_sentinel._pymupdf import load as _load_pymupdf
+
+pymupdf = _load_pymupdf()
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK

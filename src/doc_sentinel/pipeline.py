@@ -169,7 +169,8 @@ _PDF_AGGREGATE_RULES = {
 
 def _pdf_match_pages(src: Path):
     """Extract every trace span with the converter's own per-character visibility proof."""
-    import pymupdf
+    from doc_sentinel._pymupdf import load as _load_pymupdf
+    pymupdf = _load_pymupdf()
 
     from doc_sentinel.sanitize.pdf_to_docx import (
         _all_layers,
@@ -323,7 +324,8 @@ def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], li
     bboxless text matches must be independently hidden by the converter.
     Recognized aggregate findings require an exhaustive criterion scan.
     """
-    import pymupdf
+    from doc_sentinel._pymupdf import load as _load_pymupdf
+    pymupdf = _load_pymupdf()
 
     from doc_sentinel.sanitize import _normalized
     from doc_sentinel.sanitize.pdf_to_docx import _normalized_positions, _union
@@ -411,7 +413,8 @@ def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], li
 
 def _pdf_channels(src: Path, regions: list[dict]):
     """Use full page lines and exact hidden fragments, never a finding excerpt as a span."""
-    import pymupdf
+    from doc_sentinel._pymupdf import load as _load_pymupdf
+    pymupdf = _load_pymupdf()
 
     channels = [c for c in extract_channels(src, "pdf") if c.channel != "body"]
     hidden = [Channel("body", r["text"], pointer="page text", page=r["page"], hidden=True)

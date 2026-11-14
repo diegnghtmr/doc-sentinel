@@ -32,7 +32,8 @@ _PDF_AI_NAME = re.compile(
 
 
 def _assert_pdf_text_unchanged(before_path: Path, after_path: Path, message: str) -> None:
-    import pymupdf
+    from doc_sentinel._pymupdf import load as _load_pymupdf
+    pymupdf = _load_pymupdf()
 
     with pymupdf.open(before_path) as before, pymupdf.open(after_path) as after:
         if [page.get_text() for page in before] != [page.get_text() for page in after]:
