@@ -910,3 +910,58 @@ def test_repeated_and_padded_tiny_hidden_runs_all_keep_their_space(workspace):
     assert len(hidden_actions) == len(fragments)
     assert all(a["space_preserved"] and a["spacer_width_pt"] > 0 for a in hidden_actions)
     assert "Si eres" not in _body(dest)
+
+
+def test_spacer_copy_rejected_by_render_gate_falls_back_to_plain_removal(workspace, monkeypatch):
+    # e2e regression (container): spacers made a copy fail the gate that plain removal passed.
+    from doc_sentinel.sanitize import docx as impl
+
+    seen = []
+
+    def gate(src, candidate, *args, **kwargs):
+        # Deterministic stand-in for a renderer that rejects the spacer copy only.
+        with zipfile.ZipFile(candidate) as archive:
+            spaced = b"<w:spacing w:val=" in archive.read("word/document.xml")
+        seen.append(spaced)
+        if spaced:
+            return False, [], "rendered visual similarity below 0.97"
+        return True, [], "all pages compared", "exact", [1.0]
+
+    monkeypatch.setattr(impl, "render_equal", gate)
+    doc = Document()
+    doc.add_paragraph("Visible paragraph that stays.")
+    # Own paragraph: plain removal keeps the paragraph mark, so its layout is unchanged.
+    hidden = doc.add_paragraph().add_run("hidden instruction with several words and enough glyphs")
+    hidden.font.color.rgb = RGBColor(255, 255, 255)
+    hidden.font.size = Pt(3)
+    doc.add_paragraph("Another visible paragraph.")
+    src = _source(workspace, doc)
+    result, dest = _run(workspace, src)
+    _passed(result)
+    assert seen == [True, False]
+    assert result.actions[0]["space_preserved"] is False
+    assert result.actions[0]["spacer_width_pt"] == 0
+    assert result.checks["render_equal"]["status"] == "passed"
+    assert "hidden instruction" not in _body(dest)
+
+
+def test_spacer_and_plain_copies_both_rejected_stay_refused(workspace, monkeypatch):
+    from doc_sentinel.sanitize import docx as impl
+
+    calls = []
+
+    def gate(*args, **kwargs):
+        calls.append(1)
+        return False, [], "rendered visual similarity below 0.97"
+
+    monkeypatch.setattr(impl, "render_equal", gate)
+    doc = Document()
+    paragraph = doc.add_paragraph("Visible prefix ")
+    hidden = paragraph.add_run("hidden instruction with several words and enough glyphs")
+    hidden.font.color.rgb = RGBColor(255, 255, 255)
+    hidden.font.size = Pt(3)
+    paragraph.add_run(" visible suffix that stays.")
+    src = _source(workspace, doc)
+    result, dest = _run(workspace, src)
+    assert result.status == "refused" and not dest.exists()
+    assert result.refusal_reason == "rendered visual similarity below 0.97" and len(calls) == 2

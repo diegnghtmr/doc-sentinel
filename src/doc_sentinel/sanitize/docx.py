@@ -859,6 +859,7 @@ def sanitize_docx(src: Path, spans: list[dict], workdir: Path) -> Outcome:
             final_view = root / "final-view.docx"
             final_view.write_bytes(write_package(infos, _apply(entries, final_patches),
                                                  {p.part for p in final_patches}, comment, raw, start_dir))
+        plain_patches = patches
         original_pdf = None
         if any(p.technique == "hidden-run" and p.reason in {
                 "font smaller than 4 pt", "low-contrast foreground against effective background"}
@@ -872,50 +873,61 @@ def sanitize_docx(src: Path, spans: list[dict], workdir: Path) -> Outcome:
             except (OSError, ImportError, ValueError, AdapterError):
                 # Plain removal is safe; the existing render gate still decides delivery.
                 original_pdf = None
-        changed = _apply(entries, patches)
-        new_roots = _raw_roots(changed)
-        delta_ok = _delta_ok(_extractions(roots, entries), _extractions(new_roots, changed), patches)
-        remaining, _ = _plan(new_roots, changed, [])
-        streams = _streams(new_roots, changed, [])
-        still_present = any(any(_match_pointer(span, s) and span["text"] in "".join(a.char for a in s.atoms)
-                                for s in streams) for span in spans)
-        data = write_package(infos, changed, {p.part for p in patches}, comment, raw, start_dir)
-        # Re-open the actual packaged bytes, not just the in-memory XML parts.
-        import io
-        import zipfile
+        def attempt(patches):
+            changed = _apply(entries, patches)
+            new_roots = _raw_roots(changed)
+            delta_ok = _delta_ok(_extractions(roots, entries), _extractions(new_roots, changed), patches)
+            remaining, _ = _plan(new_roots, changed, [])
+            streams = _streams(new_roots, changed, [])
+            still_present = any(any(_match_pointer(span, s) and span["text"] in "".join(a.char for a in s.atoms)
+                                    for s in streams) for span in spans)
+            data = write_package(infos, changed, {p.part for p in patches}, comment, raw, start_dir)
+            # Re-open the actual packaged bytes, not just the in-memory XML parts.
+            import io
+            import zipfile
 
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            if archive.testzip() is not None:
-                raise ValueError("sanitized ZIP failed CRC verification")
-            for part in {p.part for p in patches}:
-                parse_xml(archive.read(part))
-        actions = _actions(patches)
-        checks = {
-            "opens": _check("passed", "ZIP CRC and edited XML parts verified"),
-            "extraction_delta_ok": _check("passed" if delta_ok else "failed", "compared XML text by part"),
-            "redetect_clean": _check("passed" if not remaining and not still_present else "failed",
-                                     "rescanned supported DOCX rules and supplied fragments"),
-        }
-        if not delta_ok or remaining or still_present:
-            checks["render_equal"] = _check("skipped", "earlier self-check failed")
-            return Outcome("refused", actions=actions, checks=checks, reason="DOCX text self-check failed")
-        candidate = root / "candidate.docx"
-        candidate.write_bytes(data)
-        reference = None
-        if visible:
-            # Start from the original bytes and apply only final-view changes and
-            # explicitly authorized on-page injections, not hidden-content edits.
-            reference_patches = [p for p in patches if p in final_patches or p.on_page]
-            reference = root / "visible-edits.docx"
-            reference.write_bytes(write_package(infos, _apply(entries, reference_patches),
-                                                {p.part for p in reference_patches},
-                                                comment, raw, start_dir))
-        comparison = render_equal(final_view, candidate, visible, workdir, reference=reference,
-                                  hidden=[p.text for p in patches if p.visibility == "hidden"],
-                                  original_pdf=original_pdf)
-        equal, regions, reason = comparison[:3]
-        details = ({"mode": comparison[3], "similarity": comparison[4]} if len(comparison) == 5 else {})
-        checks["render_equal"] = _check("passed" if equal else "failed", reason, regions=regions, **details)
-        if not equal:
-            return Outcome("refused", actions=actions, checks=checks, reason=reason)
-        return Outcome("sanitized", data, actions, checks)
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                if archive.testzip() is not None:
+                    raise ValueError("sanitized ZIP failed CRC verification")
+                for part in {p.part for p in patches}:
+                    parse_xml(archive.read(part))
+            actions = _actions(patches)
+            checks = {
+                "opens": _check("passed", "ZIP CRC and edited XML parts verified"),
+                "extraction_delta_ok": _check("passed" if delta_ok else "failed", "compared XML text by part"),
+                "redetect_clean": _check("passed" if not remaining and not still_present else "failed",
+                                         "rescanned supported DOCX rules and supplied fragments"),
+            }
+            if not delta_ok or remaining or still_present:
+                checks["render_equal"] = _check("skipped", "earlier self-check failed")
+                return Outcome("refused", actions=actions, checks=checks, reason="DOCX text self-check failed")
+            candidate = root / "candidate.docx"
+            candidate.write_bytes(data)
+            reference = None
+            if visible:
+                # Start from the original bytes and apply only final-view changes and
+                # explicitly authorized on-page injections, not hidden-content edits.
+                reference_patches = [p for p in patches if p in final_patches or p.on_page]
+                reference = root / "visible-edits.docx"
+                reference.write_bytes(write_package(infos, _apply(entries, reference_patches),
+                                                    {p.part for p in reference_patches},
+                                                    comment, raw, start_dir))
+            comparison = render_equal(final_view, candidate, visible, workdir, reference=reference,
+                                      hidden=[p.text for p in patches if p.visibility == "hidden"],
+                                      original_pdf=original_pdf)
+            equal, regions, reason = comparison[:3]
+            details = ({"mode": comparison[3], "similarity": comparison[4]} if len(comparison) == 5 else {})
+            checks["render_equal"] = _check("passed" if equal else "failed", reason, regions=regions, **details)
+            if not equal:
+                return Outcome("refused", actions=actions, checks=checks, reason=reason)
+            return Outcome("sanitized", data, actions, checks)
+
+        outcome = attempt(patches)
+        if (outcome.status == "refused" and patches != plain_patches and
+                outcome.checks.get("render_equal", {}).get("status") == "failed"):
+            # Layout spacers are an attempt to keep the page; when the gate rejects
+            # them, plain removal (never worse than before spacers) is tried once.
+            plain = attempt(plain_patches)
+            if plain.status == "sanitized":
+                return plain
+        return outcome
