@@ -17,6 +17,24 @@ _SEP = r"[\s_-]+"
 _IA = r"(?:i\s*\.?\s*a\.?|inteligencia[\s_-]+artificial|lenguaje)"
 
 _PRODUCT = r"(?:chatgpt|gpt(?:[\s_-]*\d[\w.]*)?|claude|gemini|copilot|bard|llama|dan|grok|mistral)"
+_LIMITLESS_ES = rf"sin{_SEP}(?:restricciones|reglas|limites|filtros|censura)"
+_LIMITLESS_EN = rf"(?:without|with{_SEP}no){_SEP}(?:rules|restrictions|limits|filters|censorship)"
+_ADJ_ES = (rf"(?:(?!(?:en|de|del|para|con|sobre|y|o|que|a)\b)[a-z]+{_SEP}){{0,2}}?")
+_ADJ_EN = (rf"(?:(?!(?:in|of|for|on|about|at|with|to|and|or|that|from)\b)[a-z]+{_SEP}){{0,2}}?")
+# Generic nouns (sistema, modelo, asistente, agente) only count when qualified as AI or
+# as unrestricted; chatbot / bot / IA are AI roles by themselves.
+_ROLE_ES = (rf"(?:{_IA}|chatbot|bot)(?!\w)"
+            rf"|(?:sistema|modelo|programa|herramienta|asistente|agente){_SEP}"
+            rf"(?:(?:de|basado{_SEP}en){_SEP}{_IA}(?!\w)|{_LIMITLESS_ES}\b)"
+            rf"|(?:asistente|agente){_SEP}virtual\b")
+_ROLE_EN = (rf"(?:ai|chatbot|bot|(?:language|ai){_SEP}model)\b"
+            rf"|(?:helpful|unrestricted|uncensored|jailbroken|virtual|evil){_SEP}"
+            rf"(?:assistant|agent)\b"
+            rf"|(?:assistant|agent){_SEP}{_LIMITLESS_EN}\b")
+# A product name is a role only when nothing but punctuation or a connective follows, so
+# "Eres ahora Claude Monet" (a painter) is not flagged.
+_PRODUCT_ROLE = (rf"(?:(?:microsoft|openai|google|anthropic|meta){_SEP})?{_PRODUCT}(?!\w)"
+                 r"(?=\s*(?:$|[^\w\s]|(?:sin|without|que|who|and|y|an?|una?|el|la|the)\b))")
 
 # Declaration order is the stable order used for evidence.rules. Family D is
 # contextual: it is included only when family A also occurs in that channel.
@@ -42,15 +60,13 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
     ("forget_en", "b", rf"\bforget{_SEP}(?:everything|all){_SEP}(?:above|before)\b"),
     ("system_prompt", "c", rf"\bsystem{_SEP}prompt\b"),
     # Role hijack needs an explicit AI role or a product name; ordinary prose such as
-    # "eres ahora mayor de edad" or "ahora eres un modelo a seguir" must not match.
+    # "eres ahora mayor de edad", "un modelo a seguir", "un estudiante de IA" or
+    # "Claude Monet" must not match. Up to two adjectives may precede the role, but never
+    # a preposition (so "un experto en sistemas de IA" stays prose).
     ("role_es", "c", (rf"\b(?:eres{_SEP}ahora|ahora{_SEP}eres){_SEP}(?:"
-        rf"(?:un|una|el|la){_SEP}(?:(?:nuevo|nueva|otro|otra){_SEP})?"
-        rf"(?:{_IA}|asistente|agente|chatbot|bot|modelo{_SEP}(?:de{_SEP})?{_IA})"
-        rf"|{_PRODUCT})(?!\w)")),
+        rf"(?:un|una|el|la){_SEP}{_ADJ_ES}(?:{_ROLE_ES})|{_PRODUCT_ROLE})")),
     ("role_en", "c", (rf"\byou{_SEP}are{_SEP}now{_SEP}(?:"
-        rf"(?:an?|the){_SEP}(?:(?:new|unrestricted|helpful|different){_SEP})?"
-        rf"(?:ai|assistant|chatbot|agent|bot|(?:language|ai){_SEP}model)"
-        rf"|{_PRODUCT})(?!\w)")),
+        rf"(?:an?|the){_SEP}{_ADJ_EN}(?:{_ROLE_EN})|{_PRODUCT_ROLE})")),
     ("new_instructions_en", "c", rf"\bnew{_SEP}instructions\s*:"),
     ("new_instructions_es", "c", rf"\bnuevas{_SEP}instrucciones\s*:"),
     ("system_token", "c", r"\[system\]"),
@@ -67,12 +83,17 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
     ("markdown_image", "e", r"!\["),
 ))
 _EMAIL = r"[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8}"  # bounded: no backtracking blowup
+# Complete destinations (scheme, host and path; bounded) so an invisible character anywhere
+# inside the URL or e-mail is checked for obfuscation. Markdown links "[text](url)" too.
+_URL = r"(?:https?://|www\.)[^\s<>\"'()\[\]]{1,2048}"
+_DESTINATION = (rf"(?:[<\"'«(\[]?(?:{_URL}|{_EMAIL})"
+                rf"|\[[^\[\]\n]{{0,120}}\]\(\s*{_URL})")
 # Separate prefix and destination searches avoid quadratic backtracking on a
 # hostile channel containing many exfiltration prefixes but no destination.
 _EXFIL_DESTINATIONS = {
-    "exfiltration_en": re.compile(rf"\bto{_SEP}[<\"'«(\[]?(?:https?\b|www\b|{_EMAIL})"),
-    "exfiltration_es": re.compile(rf"\ba{_SEP}[<\"'«(\[]?(?:https?\b|www\b|{_EMAIL})"),
-    "markdown_image": re.compile(r"\]\(\s*https?\b"),
+    "exfiltration_en": re.compile(rf"\bto{_SEP}{_DESTINATION}"),
+    "exfiltration_es": re.compile(rf"\ba{_SEP}{_DESTINATION}"),
+    "markdown_image": re.compile(rf"\]\(\s*{_URL}"),
 }
 
 _HIGH_CHANNELS = frozenset({
