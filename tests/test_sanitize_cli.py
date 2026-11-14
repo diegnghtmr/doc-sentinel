@@ -671,6 +671,29 @@ def test_pdf_exam_with_real_adapters_locates_bboxless_findings(workspace, corpus
     assert digest(src) == before
 
 
+@pytest.mark.parametrize("name", ["pdf-white-on-white", "pdf-tiny-text", "pdf-ocg-off",
+                                  "pdf-behind-rectangle", "pdf-outside-cropbox", "exam-hidden-ai"])
+def test_generated_pdf_real_adapters_sanitize_and_redetect(workspace, corpus_directory, capsys, name):
+    src, out = workspace / f"{name}.pdf", workspace / f"{name}.sanitized.docx"
+    src.write_bytes((corpus_directory / src.name).read_bytes())
+    before = digest(src)
+    code, stdout, stderr = invoke(capsys, "detect", src, "--sanitize", "-o", out, "--agent-summary")
+    safe = json.loads(stdout)
+    assert (code, safe["exit_code"], safe["verdict"], safe["sanitize"]["status"]) == (
+        1, 1, "findings", "sanitized"), safe["sanitize"]
+    assert stderr and safe["sanitize"]["output_path"] == str(out) and out.is_file()
+    assert safe["adapters"]["failed"] == safe["adapters"]["skipped"] == []
+    assert {"perlecta", "hidden-text-detector", "subtext-scan", "chk_defaced"} <= set(
+        safe["adapters"]["run"])
+    assert digest(src) == before
+
+    code, stdout, stderr = invoke(capsys, "detect", out, "--agent-summary")
+    redetected = json.loads(stdout)
+    assert (code, redetected["exit_code"], redetected["verdict"]) == (0, 0, "clean")
+    assert stderr and redetected["adapters"]["failed"] == redetected["adapters"]["skipped"] == []
+    assert digest(src) == before
+
+
 class PdfFindingWithoutBox:
     id = "hidden-text-detector"
 
@@ -687,6 +710,94 @@ class PdfFindingWithoutBox:
                         cls="hidden_text", severity="high", excerpt=self.text,
                         evidence={"detail": f"Content: {self.text!r}"},
                         location=Location(file=src.name, page=self.page))]
+
+
+class PdfNativeWhiteAdapter:
+    """A native box for each synthetic white-on-white span, but not visible text."""
+
+    id = "perlecta"
+
+    def __init__(self, text):
+        self.text = text
+
+    def available(self):
+        return Capability(True)
+
+    def inspect(self, src, ctx):
+        import pymupdf
+
+        if src.suffix.lower() != ".pdf":
+            return []
+        findings = []
+        with pymupdf.open(src) as pdf:
+            for page in pdf:
+                for block in page.get_text("dict")["blocks"]:
+                    for line in block.get("lines", []):
+                        for span in line["spans"]:
+                            if span["text"] != self.text or span["color"] != 0xffffff:
+                                continue
+                            box = pymupdf.Rect(span["bbox"]) * ~page.transformation_matrix
+                            findings.append(Finding(
+                                adapter=self.id, adapter_code="PDF_COULEUR_FOND", cls="hidden_text",
+                                severity="high", excerpt=self.text,
+                                location=Location(file=src.name, page=page.number + 1, bbox=list(box))))
+        return findings
+
+
+def _pdf_native_and_bboxless(monkeypatch, text, bboxless):
+    native = PdfNativeWhiteAdapter(text)
+    monkeypatch.setattr(registry, "detect_plan", lambda dtype: (
+        [native, bboxless, InstructionPhrasesAdapter()],
+        {native.id, bboxless.id, "instruction-phrases"}))
+
+
+@pytest.mark.parametrize("mode", ["detect", "review"])
+@pytest.mark.parametrize("copies,duplicate", [(1, "none"), (2, "none"), (1, "same-page"),
+                                               (1, "other-page")])
+def test_pdf_bboxless_matches_require_each_occurrence_covered_or_hidden(
+        monkeypatch, workspace, capsys, mode, copies, duplicate):
+    from reportlab.pdfgen import canvas
+
+    text = "Synthetic concealed content."
+    src, out = workspace / "source.pdf", workspace / "output.docx"
+    pdf = canvas.Canvas(str(src), pagesize=(500, 500), invariant=1)
+    pdf.drawString(30, 450, "Ordinary visible content.")
+    pdf.setFillColorRGB(1, 1, 1)
+    pdf.setFont("Helvetica", 9)
+    for index in range(copies):
+        pdf.drawString(30, 400 - 20 * index, text)
+    if duplicate != "none":
+        if duplicate == "other-page":
+            pdf.showPage()
+            pdf.setFont("Helvetica", 9)
+        pdf.setFillColorRGB(0, 0, 0)
+        pdf.drawString(30, 330, text)
+    pdf.save()
+    before = digest(src)
+    _pdf_native_and_bboxless(monkeypatch, text, PdfFindingWithoutBox(
+        text, page=None if duplicate == "other-page" else 1))
+    if duplicate != "none":
+        out.write_bytes(b"existing output")
+    if mode == "review":
+        review = workspace / "review"
+        code, stdout, stderr = invoke(capsys, "detect", src, "--review-dir", review, "--agent-summary")
+        assert code == 1 and stderr and json.loads(stdout)["verdict"] == "findings"
+        args = ("sanitize", src, "--review-dir", review)
+    else:
+        args = ("detect", src, "--sanitize")
+    code, stdout, stderr = invoke(capsys, *args, "-o", out, "--force-output", "--agent-summary")
+    safe = json.loads(stdout)
+    assert stderr and safe["verdict"] == "findings" and digest(src) == before
+    if duplicate != "none":
+        assert (code, safe["exit_code"], safe["sanitize"]["status"]) == (2, 2, "refused")
+        assert safe["sanitize"]["refusal_reason"] == "PDF hidden text match is not verifiably hidden"
+        assert out.read_bytes() == b"existing output"
+    else:
+        assert (code, safe["exit_code"], safe["sanitize"]["status"]) == (1, 1, "sanitized")
+        assert out.is_file() and safe["sanitize"]["counts"]["visibility"]["hidden"] == copies
+        code, stdout, stderr = invoke(capsys, "detect", out, "--agent-summary")
+        assert code == 0 and stderr and json.loads(stdout)["verdict"] == "clean"
+        assert digest(src) == before
 
 
 def _make_text_match_pdf(path, text, *, pages=1, duplicate_visible=False,
@@ -780,6 +891,37 @@ class PdfAggregateFinding:
                     {"message": f'extracted but not visible, e.g. "{self.sample}"'})
         return [Finding(adapter=self.id, adapter_code=self.code, cls="hidden_text", severity="high",
                         location=Location(file=src.name, page=1), excerpt=self.sample, evidence=evidence)]
+
+
+@pytest.mark.parametrize("visible_candidate", [False, True])
+def test_pdf_aggregate_requires_independent_hiddenness_even_with_native_box(
+        monkeypatch, workspace, capsys, visible_candidate):
+    from reportlab.pdfgen import canvas
+
+    text = "Synthetic concealed content."
+    src, out = workspace / "source.pdf", workspace / "output.docx"
+    pdf = canvas.Canvas(str(src), pagesize=(500, 500), invariant=1)
+    pdf.drawString(30, 450, "Ordinary visible content.")
+    pdf.setFillColorRGB(1, 1, 1)
+    pdf.setFont("Helvetica", 9)
+    pdf.drawString(30, 400, text)
+    if visible_candidate:
+        pdf.setFillColorRGB(0, 0, 0)
+        pdf.rect(20, 300, 200, 40, fill=1, stroke=0)
+        pdf.setFillColorRGB(1, 1, 1)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(30, 310, "Visible white text.")
+    pdf.save()
+    before = digest(src)
+    _pdf_native_and_bboxless(monkeypatch, text, PdfAggregateFinding("PDF.INVISIBLE_TEXT_COLOR", text))
+    out.write_bytes(b"existing output")
+    code, stdout, stderr = invoke(capsys, "detect", src, "--sanitize", "-o", out,
+                                  "--force-output", "--agent-summary")
+    safe = json.loads(stdout)
+    assert stderr and safe["verdict"] == "findings" and digest(src) == before
+    assert (code, safe["exit_code"], safe["sanitize"]["status"]) == (2, 2, "refused")
+    assert safe["sanitize"]["refusal_reason"] == "PDF aggregate criterion has an unverifiable span"
+    assert out.read_bytes() == b"existing output"
 
 
 def _make_aggregate_pdf(path, *, visible_tiny=False, visible_white=False):

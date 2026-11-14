@@ -239,8 +239,28 @@ def _pdf_match_pages(src: Path):
                     spans.append({"entries": entries, "tiny_text": tiny,
                                   "invisible_color": any(color_candidate(c, pix) for _, c, _ in entries)})
                     stream.extend(entries)
-                pages.append({"stream": stream, "spans": spans})
+                pages.append({"stream": stream, "spans": spans, "extracted": extracted})
     return pages
+
+
+def _pdf_native_coverage(pages: list[dict], regions: list[dict]) -> set[int]:
+    """Use the converter's exact region binding without changing independent proofs."""
+    from doc_sentinel.sanitize.pdf_to_docx import _validate_spans
+
+    regions = [region for region in regions if not region.get("auto_excluded")]
+    if not regions:
+        return set()
+    chars = [char for page in pages for line in page["extracted"].lines for char in line.chars]
+    saved = [(char, char.technique, char.reason) for char in chars]
+    try:
+        # Validate all characters, including those the converter already excludes.
+        for char in chars:
+            char.technique = ""
+        _validate_spans([page["extracted"] for page in pages], regions, [])
+        return {id(char) for char in chars if char.technique == "hidden-region"}
+    finally:
+        for char, technique, reason in saved:
+            char.technique, char.reason = technique, reason
 
 
 def _pdf_add_verified_regions(regions: list[dict], page: int, entries: list[tuple]) -> None:
@@ -320,9 +340,9 @@ def _pdf_native_text(finding: dict) -> str | None:
 def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], list[dict], str | None]:
     """Bind PDF findings to complete text and MuPDF top-left point geometry.
 
-    Native Perlecta/subtext boxes are in bottom-left PDF user space. All
-    bboxless text matches must be independently hidden by the converter.
-    Recognized aggregate findings require an exhaustive criterion scan.
+    Native Perlecta/subtext boxes are in bottom-left PDF user space. Every
+    bboxless text match must be covered by a validated native region or be
+    independently hidden. Aggregate findings require an independent exhaustive scan.
     """
     from doc_sentinel._pymupdf import load as _load_pymupdf
     pymupdf = _load_pymupdf()
@@ -331,6 +351,7 @@ def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], li
     from doc_sentinel.sanitize.pdf_to_docx import _normalized_positions, _union
 
     regions, located, missing = [], [], []
+    pages = None
     with pymupdf.open(src) as pdf:
         for finding in findings:
             if finding.get("class") not in {"hidden_text", "visual_divergence"}:
@@ -358,16 +379,34 @@ def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], li
                                for char in span["chars"]
                                if pymupdf.Rect(char["bbox"]).intersects(mapped))
             if _normalized(text) != _normalized(selected):
-                return regions, located, "PDF hidden text geometry cannot be verified"
-            region = {"page": page, "bbox": list(mapped), "text": selected,
-                      "technique": "hidden-region"}
-            if region not in regions:
-                regions.append(region)
+                # The default rawdict omits OFF-layer and outside-CropBox text.
+                # Bind those boxes to the converter's all-layer trace only when
+                # every selected character is independently verified hidden.
+                if pages is None:
+                    pages = _pdf_match_pages(src)
+                stream = pages[page - 1]["stream"]
+                if any(char is None for _, char, _ in stream):
+                    return regions, located, "PDF hidden text geometry cannot be verified"
+                entries = [item for item in stream if pymupdf.Rect(item[1].bbox).intersects(mapped)]
+                if (_normalized(text) != _normalized("".join(item[0] for item in entries)) or
+                        any(item[1].technique not in _PDF_VERIFIED_HIDDEN for item in entries)):
+                    return regions, located, "PDF hidden text geometry cannot be verified"
+                _pdf_add_verified_regions(regions, page, entries)
+            else:
+                region = {"page": page, "bbox": list(mapped), "text": selected,
+                          "technique": "hidden-region"}
+                if region not in regions:
+                    regions.append(region)
             located.append({"finding_id": finding.get("finding_id"), "method": "native_bbox",
                             "page": page, "bbox": list(mapped)})
     if not missing:
         return regions, located, None
-    pages = _pdf_match_pages(src)
+    if pages is None:
+        pages = _pdf_match_pages(src)
+    try:
+        native_covered = _pdf_native_coverage(pages, regions)
+    except ValueError:
+        return regions, located, "PDF hidden text geometry cannot be verified"
     for finding in missing:
         text = _pdf_native_text(finding)
         criterion = _pdf_aggregate_criterion(finding)
@@ -402,7 +441,8 @@ def _pdf_hidden_regions(src: Path, findings: list[dict]) -> tuple[list[dict], li
             chars = [item[1] for item in match]
             if any(char is None for char in chars):
                 return regions, located, "PDF hidden text geometry cannot be verified"
-            if any(char.technique not in _PDF_VERIFIED_HIDDEN for char in chars):
+            if any(char.technique not in _PDF_VERIFIED_HIDDEN and id(char) not in native_covered
+                   for char in chars):
                 return regions, located, "PDF hidden text match is not verifiably hidden"
         for number, match in matches:
             _pdf_add_verified_regions(regions, number, match)
