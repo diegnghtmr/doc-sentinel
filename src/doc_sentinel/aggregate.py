@@ -41,7 +41,8 @@ def _same(a: Finding, b: Finding) -> bool:
 def dedupe(findings: Iterable[Finding]) -> list[Finding]:
     """Merge findings with same class, channel, page, overlapping bbox and normalized excerpt.
 
-    No voting: the merged finding keeps the maximum severity and lists every adapter.
+    No voting: the merged finding keeps the maximum severity, lists every adapter, and keeps
+    the evidence of each later adapter under ``evidence["merged_evidence"][<adapter>]``.
     """
     merged: list[Finding] = []
     for item in findings:
@@ -50,6 +51,9 @@ def dedupe(findings: Iterable[Finding]) -> list[Finding]:
                 for name in item.adapters:
                     if name not in kept.adapters:
                         kept.adapter = kept.adapters + [name]
+                        if item.evidence:
+                            kept.evidence.setdefault("merged_evidence", {})[name] = (
+                                copy.deepcopy(item.evidence))
                 if SEVERITY_RANK[item.severity] > SEVERITY_RANK[kept.severity]:
                     kept.severity = item.severity
                 break

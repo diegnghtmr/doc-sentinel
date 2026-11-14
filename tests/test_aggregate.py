@@ -112,3 +112,23 @@ def test_finding_rejects_unknown_vocabulary():
         f(sev="urgent")
     with pytest.raises(ValueError):
         f(channel="nowhere")
+
+
+def test_dedupe_keeps_evidence_of_every_merged_adapter():
+    a = f(adapter="subtext-scan", sev="high", excerpt="Ignore previous instructions")
+    a.evidence = {"rule": "instruction-phrasing"}
+    b = f(adapter="instruction-phrases", sev="high", excerpt="Ignore previous instructions")
+    b.evidence = {"rules": ["override_en"], "obfuscated": True}
+    merged, = dedupe([a, b])
+    assert merged.adapter == ["subtext-scan", "instruction-phrases"]
+    assert merged.evidence["rule"] == "instruction-phrasing"
+    assert merged.evidence["merged_evidence"] == {
+        "instruction-phrases": {"rules": ["override_en"], "obfuscated": True}}
+
+
+def test_dedupe_does_not_mutate_input_findings():
+    a = f(adapter="perlecta", excerpt="x")
+    b = f(adapter="htd", excerpt="x")
+    b.evidence = {"k": 1}
+    dedupe([a, b])
+    assert a.evidence == {} and a.adapter == "perlecta"
