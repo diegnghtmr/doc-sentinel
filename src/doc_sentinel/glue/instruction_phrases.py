@@ -93,6 +93,18 @@ def _filename_source(filename: str) -> tuple[str, list[int]]:
     return "".join(chars), offsets
 
 
+def _any_obfuscated(source: str, folded: str, rule_names: set[str]) -> bool:
+    """True when an invisible format char sits inside any occurrence of a matched rule."""
+    for name, _family, pattern in _RULES:
+        if name not in rule_names:
+            continue
+        for match in pattern.finditer(folded):
+            start, end = _original_span(source, match.start(), match.end())
+            if any(unicodedata.category(c) == "Cf" for c in source[start:end]):
+                return True
+    return False
+
+
 def _original_span(text: str, start: int, end: int) -> tuple[int, int]:
     """Map folded offsets back to original text, including stripped format characters."""
     position = 0
@@ -150,9 +162,10 @@ class InstructionPhrasesAdapter:
             matches = [item for item in matches if item[1] != "d" or has_condition]
             _, _, first_start, first_end = min(matches, key=lambda item: item[2])
             start, end = _original_span(source, first_start, first_end)
-            # Invisible format characters inside the matched instruction are deliberate
-            # evasion: a document that merely discusses injection does not do that.
-            obfuscated = any(unicodedata.category(c) == "Cf" for c in source[start:end])
+            # Invisible format characters inside ANY matched instruction occurrence (not only
+            # the first one) are deliberate evasion: a document that merely discusses
+            # injection does not do that.
+            obfuscated = _any_obfuscated(source, text, {name for name, _, _, _ in matches})
             if offsets is not None:
                 start, end = offsets[start], offsets[end - 1] + 1
             left = max(0, start - 120)
