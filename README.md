@@ -26,6 +26,8 @@ outside the document; the verdict comes from a deterministic aggregator, never f
 an empty network namespace (`unshare -rn`). If that namespace cannot be created, offline steps
 **fail closed** (adapter error, never `clean`) unless isolation is declared external with
 `DOC_SENTINEL_NO_NETNS=1` (as the containers do, since they run with `--network=none`).
+That declaration is verified: it is honored only when the process sees no network interface
+other than loopback; otherwise `unshare -rn` is used, or the step fails closed.
 If channel extraction fails (e.g. an archive part over the size limit), the verdict is `error`.
 
 ## Sub-harnesses

@@ -288,12 +288,53 @@ def test_run_tool_fails_closed_without_network_isolation(monkeypatch, tmp_path):
         base.run_tool(["python3", "-c", "print('ran')"], ctx)
 
 
+def _fake_sys_class_net(tmp_path, *names):
+    net = tmp_path / "sys-class-net"
+    net.mkdir()
+    for name in names:
+        (net / name).mkdir()
+    return net
+
+
 def test_run_tool_trusts_declared_external_isolation(monkeypatch, tmp_path):
     from doc_sentinel.adapters import base
     monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")  # e.g. container with --network=none
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo"))
     monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
     ctx = base.RunContext(workdir=tmp_path, allow_network=False)
     assert base.run_tool(["python3", "-c", "print('ran')"], ctx).stdout.strip() == "ran"
+
+
+def test_declared_isolation_with_real_interfaces_fails_closed(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")  # set, but the process does have network
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo", "eth0"))
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="DOC_SENTINEL_NO_NETNS=1 .*eth0"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+def test_declared_isolation_unverifiable_fails_closed(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")
+    monkeypatch.setattr(base, "SYS_CLASS_NET", tmp_path / "missing")
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="cannot verify"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare not available")
+def test_false_declaration_still_uses_sandbox_when_available(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    if not base.network_sandbox_available():
+        pytest.skip("user namespaces unavailable")
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo", "eth0"))
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    child = base.run_tool(["readlink", "/proc/self/ns/net"], ctx).stdout.strip()
+    assert child and child != os.readlink("/proc/self/ns/net")
 
 
 def test_run_tool_allow_network_needs_no_sandbox(monkeypatch, tmp_path):

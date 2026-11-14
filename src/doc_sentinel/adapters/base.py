@@ -104,6 +104,25 @@ def network_sandbox_available() -> bool:
     return probe.returncode == 0
 
 
+SYS_CLASS_NET = Path("/sys/class/net")
+
+
+def _external_isolation_problem() -> str | None:
+    """Why the declared external isolation cannot be trusted, or None when it holds.
+
+    ``DOC_SENTINEL_NO_NETNS=1`` is only honored when this process sees no network interface
+    other than loopback, which is what ``docker run --network=none`` provides.
+    """
+    try:
+        names = sorted(entry.name for entry in SYS_CLASS_NET.iterdir())
+    except OSError:
+        return f"cannot verify network interfaces ({SYS_CLASS_NET} unreadable)"
+    extra = [name for name in names if name != "lo"]
+    if extra:
+        return "network interfaces are present: " + ", ".join(extra)
+    return None
+
+
 def child_env(ctx: RunContext, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {k: os.environ[k] for k in _ENV_ALLOW if k in os.environ}
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -130,10 +149,16 @@ def run_tool(cmd: Sequence[str], ctx: RunContext, *, cwd: Path | None = None,
     """
     argv = [str(c) for c in cmd]
     if not ctx.allow_network:
-        if os.environ.get("DOC_SENTINEL_NO_NETNS") == "1":
-            pass  # isolation is declared external (e.g. container with --network=none)
+        declared = os.environ.get("DOC_SENTINEL_NO_NETNS") == "1"
+        problem = _external_isolation_problem() if declared else "not declared"
+        if problem is None:
+            pass  # verified: no interface other than loopback (container --network=none)
         elif network_sandbox_available():
             argv = ["unshare", "-rn", "--", *argv]
+        elif declared:
+            # The declaration is false or unverifiable: never trust it, fail closed.
+            raise AdapterError(f"DOC_SENTINEL_NO_NETNS=1 but {problem}; run the container "
+                               "with --network=none")
         else:
             # Fail closed: never run an offline step with network access.
             raise AdapterError(
