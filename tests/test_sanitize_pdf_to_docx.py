@@ -69,6 +69,7 @@ def _assert_checks(result, pages=1):
         assert result.checks[key]["status"] == "passed", result.checks
     similarity = result.checks["visual_similarity"]
     assert len(similarity["pages"]) == pages
+    assert similarity["source_pages"] == similarity["output_pages"] == pages
     assert all(-1 <= page["similarity"] <= 1 for page in similarity["pages"])
 
 
@@ -422,10 +423,13 @@ def test_repeated_top_and_bottom_lines_are_headers_and_footers(tmp_path):
 
 
 def test_scanned_full_page_image_stays_on_one_page(tmp_path, corpus_directory):
+    from docx.oxml.ns import qn
+
     src, dest = corpus_directory / "pdf-scanned-ocr.pdf", tmp_path / "result.docx"
     result = _result(src, dest, tmp_path)
     _assert_checks(result)
-    assert len(Document(dest).inline_shapes) == 1
+    doc = Document(dest)
+    assert len(doc.inline_shapes) + len(list(doc.element.body.iter(qn("wp:anchor")))) == 1
     assert result.checks["visual_similarity"]["output_pages"] == 1
 
 
@@ -450,6 +454,310 @@ def test_redetect_scans_the_delivered_filename(tmp_path):
     result = _result(src, dest, tmp_path)
     assert result.status == "refused"
     assert result.checks["redetect_clean"]["status"] == "failed"
+
+
+def test_fidelity_paragraph_merge_indents_and_spacing(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(50, 450, "A first line")
+    pdf.drawString(40, 435, "A second line")
+    pdf.drawString(40, 420, "A final line")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    assert _text(doc) == "A first line A second line A final line"
+    paragraphs = [paragraph for paragraph in doc.paragraphs if paragraph.text.strip()]
+    assert len(paragraphs) == 1
+    paragraph = paragraphs[0]
+    assert paragraph.paragraph_format.first_line_indent.pt == pytest.approx(10, abs=1)
+    spacing = paragraph._p.pPr.find(qn("w:spacing"))
+    assert spacing.get(qn("w:lineRule")) in {"exact", "atLeast"}
+    assert int(spacing.get(qn("w:line"))) == pytest.approx(300, abs=20)
+
+
+def test_fidelity_margins_match_single_line_content_bbox(tmp_path, corpus_directory):
+    src, dest = corpus_directory / "pdf-plain.pdf", tmp_path / "result.docx"
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    with pymupdf.open(src) as pdf:
+        page = pdf[0]
+        x0, y0, x1, y1 = page.get_text("dict")["blocks"][0]["bbox"]
+        expected = (x0, y0, page.rect.width - x1, page.rect.height - y1)
+    section = Document(dest).sections[0]
+    actual = (section.left_margin.pt, section.top_margin.pt,
+              section.right_margin.pt, section.bottom_margin.pt)
+    assert actual == pytest.approx(expected, abs=0.1)
+    assert result.checks["visual_similarity"]["pages"][0]["similarity"] >= 0.85
+
+
+def test_fidelity_hyphenated_lines_keep_visible_text(tmp_path):
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.drawString(30, 450, "A hyphen-")
+    pdf.drawString(30, 435, "ated example")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    paragraphs = [p for p in doc.paragraphs if p.text.strip()]
+    assert len(paragraphs) == 1
+    assert _text(doc) == "A hyphen-ated example"
+    assert not result.actions
+
+
+@pytest.mark.parametrize("alignment", ["center", "right", "justify"])
+def test_fidelity_alignment(tmp_path, alignment):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.setFont("Helvetica", 12)
+    if alignment == "center":
+        pdf.drawCentredString(200, 450, "Centered heading")
+    elif alignment == "right":
+        pdf.drawRightString(370, 450, "Right aligned")
+    else:
+        pdf.drawString(30, 450, "A lengthy paragraph fills this line from one edge to the far side.")
+        pdf.drawString(30, 435, "Another long paragraph fills this line across to the other side.")
+        pdf.drawString(30, 420, "A short ending.")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    paragraph = next(p for p in Document(dest).paragraphs if p.text.strip())
+    expected = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT,
+                "justify": WD_ALIGN_PARAGRAPH.JUSTIFY}
+    assert paragraph.alignment == expected[alignment]
+
+
+def test_fidelity_underline_and_strike_from_pdf_lines(tmp_path):
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(30, 450, "Underlined")
+    pdf.line(30, 448, 30 + pdf.stringWidth("Underlined", "Helvetica", 12), 448)
+    pdf.drawString(30, 410, "Struck")
+    pdf.line(30, 414, 30 + pdf.stringWidth("Struck", "Helvetica", 12), 414)
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    runs = [run for paragraph in Document(dest).paragraphs for run in paragraph.runs]
+    assert next(run for run in runs if "Underlined" in run.text).underline
+    assert next(run for run in runs if "Struck" in run.text).font.strike
+
+
+def test_fidelity_two_column_layout(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(30, 450, "Left column one")
+    pdf.drawString(30, 435, "Left column two")
+    pdf.drawString(220, 450, "Right column one")
+    pdf.drawString(220, 435, "Right column two")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    assert all(text in _text(doc) for text in ("Left column one", "Left column two",
+                                                "Right column one", "Right column two"))
+    cols = doc.sections[0]._sectPr.find(qn("w:cols"))
+    assert cols is not None and cols.get(qn("w:num")) == "2"
+
+
+def test_fidelity_three_column_layout(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    for x, label in ((30, "First"), (150, "Second"), (270, "Third")):
+        pdf.drawString(x, 450, f"{label} item one")
+        pdf.drawString(x, 435, f"{label} item two")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    assert all(f"{label} item one" in _text(doc) for label in ("First", "Second", "Third"))
+    cols = doc.sections[0]._sectPr.find(qn("w:cols"))
+    assert cols is not None and cols.get(qn("w:num")) == "3"
+
+
+def test_fidelity_ambiguous_columns_fall_back_to_one(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.drawString(30, 450, "Left item")
+    pdf.drawString(220, 450, "Right item")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    cols = doc.sections[0]._sectPr.find(qn("w:cols"))
+    assert cols is None or cols.get(qn("w:num")) in {None, "1"}
+    assert "Left item" in _text(doc) and "Right item" in _text(doc)
+
+
+def test_fidelity_merged_table_cells(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    for y in (300, 340, 380):
+        pdf.line(30, y, 290, y)
+    pdf.line(30, 300, 30, 380)
+    pdf.line(290, 300, 290, 380)
+    pdf.line(160, 300, 160, 340)
+    for x, y, text in ((40, 355, "Merged heading"), (40, 315, "Left"), (170, 315, "Right")):
+        pdf.drawString(x, y, text)
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    table = Document(dest).tables[0]
+    assert table.cell(0, 0).text == "Merged heading"
+    assert table.cell(1, 0).text == "Left" and table.cell(1, 1).text == "Right"
+    span = table.cell(0, 0)._tc.tcPr.find(qn("w:gridSpan"))
+    assert span is not None and int(span.get(qn("w:val"))) == 2
+
+
+def test_fidelity_vertical_cell_merge_and_shading(tmp_path):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.setFillColorRGB(0.8, 0.9, 1)
+    pdf.rect(30, 300, 130, 80, fill=1, stroke=0)
+    pdf.setFillColorRGB(0, 0, 0)
+    pdf.setStrokeColorRGB(1, 0, 0)
+    pdf.setLineWidth(2)
+    pdf.line(30, 300, 290, 300)
+    pdf.line(30, 380, 290, 380)
+    pdf.line(160, 340, 290, 340)
+    for x in (30, 160, 290):
+        pdf.line(x, 300, x, 380)
+    for x, y, text in ((40, 355, "Tall cell"), (170, 355, "Upper"), (170, 315, "Lower")):
+        pdf.drawString(x, y, text)
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    table = Document(dest).tables[0]
+    assert _text(Document(dest)) == "Tall cell Upper Lower"
+    top_cell, bottom_cell = table._tbl.tr_lst[0].tc_lst[0], table._tbl.tr_lst[1].tc_lst[0]
+    assert top_cell.tcPr.find(qn("w:vMerge")).get(qn("w:val")) == "restart"
+    assert bottom_cell.tcPr.find(qn("w:vMerge")) is not None
+    shade = top_cell.tcPr.find(qn("w:shd"))
+    assert shade is not None and shade.get(qn("w:fill")) == "CCE6FF"
+    border = top_cell.tcPr.find(qn("w:tcBorders")).find(qn("w:top"))
+    assert border.get(qn("w:color")) == "FF0000" and border.get(qn("w:sz")) == "16"
+    assert table.columns[0].width.pt == pytest.approx(130, abs=2)
+
+
+def test_fidelity_off_layer_shapes_do_not_become_a_table(tmp_path, corpus_directory):
+    import pikepdf
+
+    src, dest = tmp_path / "layered.pdf", tmp_path / "result.docx"
+    with pikepdf.open(corpus_directory / "pdf-ocg-off.pdf") as pdf:
+        ops = [([pikepdf.Name.OC, pikepdf.Name("/oc1")], pikepdf.Operator("BDC"))]
+        for y in (90, 120, 150):
+            ops.extend([([30, y], pikepdf.Operator("m")), ([290, y], pikepdf.Operator("l")),
+                        ([], pikepdf.Operator("S"))])
+        for x in (30, 160, 290):
+            ops.extend([([x, 90], pikepdf.Operator("m")), ([x, 150], pikepdf.Operator("l")),
+                        ([], pikepdf.Operator("S"))])
+        ops.append(([], pikepdf.Operator("EMC")))
+        pdf.pages[0].contents_add(pdf.make_stream(pikepdf.unparse_content_stream(ops)))
+        pdf.save(src)
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    assert not Document(dest).tables
+    assert any(a["technique"] == "optional-content-off" for a in result.actions)
+
+
+def test_fidelity_floating_image_beside_text(tmp_path, corpus_directory):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.drawString(30, 450, "Visible caption")
+    pdf.drawImage(ImageReader(str(corpus_directory / "png-plain.png")), 220, 430,
+                  width=120, height=40)
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    assert _text(doc) == "Visible caption"
+    anchors = list(doc.element.body.iter(qn("wp:anchor")))
+    assert len(anchors) == 1
+    assert len(doc.part.related_parts) > 0
+    horizontal = anchors[0].find(qn("wp:positionH"))
+    vertical = anchors[0].find(qn("wp:positionV"))
+    assert horizontal.get("relativeFrom") == vertical.get("relativeFrom") == "page"
+    assert int(horizontal.find(qn("wp:posOffset")).text) / 12700 == pytest.approx(220, abs=0.1)
+    assert int(vertical.find(qn("wp:posOffset")).text) / 12700 == pytest.approx(30, abs=0.1)
+    extent = anchors[0].find(qn("wp:extent"))
+    assert int(extent.get("cx")) / 12700 == pytest.approx(120, abs=0.1)
+    assert int(extent.get("cy")) / 12700 == pytest.approx(40, abs=0.1)
+
+
+def test_fidelity_image_overlapping_text_is_not_floated(tmp_path, corpus_directory):
+    from docx.oxml.ns import qn
+
+    src, dest = tmp_path / "original.pdf", tmp_path / "result.docx"
+    pdf = _canvas(src)
+    pdf.drawImage(ImageReader(str(corpus_directory / "png-plain.png")), 220, 430,
+                  width=120, height=40)
+    pdf.drawString(30, 450, "Left caption")
+    pdf.drawString(230, 450, "Text on image")
+    pdf.save()
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    doc = Document(dest)
+    assert "Left caption" in _text(doc) and "Text on image" in _text(doc)
+    assert not list(doc.element.body.iter(qn("wp:anchor")))
+    assert len(doc.inline_shapes) == 1
+
+
+def test_fidelity_scanned_image_full_page(tmp_path, corpus_directory):
+    from docx.oxml.ns import qn
+
+    src, dest = corpus_directory / "pdf-scanned-ocr.pdf", tmp_path / "result.docx"
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    assert not _text(Document(dest))
+    doc = Document(dest)
+    anchors = list(doc.element.body.iter(qn("wp:anchor")))
+    assert len(anchors) == 1 or len(doc.inline_shapes) == 1
+    assert result.checks["visual_similarity"]["output_pages"] == 1
+    assert result.checks["visual_similarity"]["pages"][0]["similarity"] >= 0.95
+
+
+@pytest.mark.parametrize("fixture", ["pdf-plain", "pdf-outside-cropbox"])
+def test_fidelity_simple_page_similarity(tmp_path, corpus_directory, fixture):
+    src, dest = corpus_directory / f"{fixture}.pdf", tmp_path / "result.docx"
+    result = _result(src, dest, tmp_path)
+    _assert_checks(result)
+    assert result.checks["visual_similarity"]["pages"][0]["similarity"] >= 0.85
+
+
+def test_fidelity_exam_similarity(tmp_path, corpus_directory):
+    src, dest = corpus_directory / "exam-hidden-ai.pdf", tmp_path / "result.docx"
+    regions = []
+    with pymupdf.open(src) as pdf:
+        for page in pdf:
+            for block in page.get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    for span in line["spans"]:
+                        if span["size"] <= 1.01 and span["color"] == 0xffffff:
+                            regions.append({"page": page.number + 1, "bbox": span["bbox"],
+                                            "text": span["text"], "technique": "fixture-1pt"})
+    result = _result(src, dest, tmp_path, hidden_regions=regions)
+    _assert_checks(result)
+    assert len(result.actions) == 4
+    assert result.checks["visual_similarity"]["pages"][0]["similarity"] >= 0.85
 
 
 def test_no_libreoffice_refused(tmp_path, monkeypatch):

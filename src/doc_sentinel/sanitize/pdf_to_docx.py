@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -23,7 +24,7 @@ import pikepdf
 import pymupdf
 from docx import Document
 from docx.enum.section import WD_SECTION
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
@@ -45,6 +46,8 @@ class _Char:
     flags: int
     color: int
     background: tuple[int, int, int] | None = None
+    underline: bool = False
+    strike: bool = False
     technique: str = ""
     reason: str = ""
     visibility: str = "hidden"
@@ -54,6 +57,7 @@ class _Char:
 class _Line:
     chars: list[_Char]
     bbox: tuple[float, float, float, float]
+    block: int = 0
 
 
 @dataclass
@@ -65,6 +69,7 @@ class _Page:
     tables: list[Any]
     links: list[dict[str, Any]]
     no_text: bool
+    drawings: list[dict[str, Any]]
 
 
 def _rect(box):
@@ -194,7 +199,7 @@ def _uniform_background(colors):
     return tuple(int(v) for v in colors[0])
 
 
-def _extract_page(page, off_names, background, images, default_counts):
+def _extract_page(page, off_names, background, images, default_counts, drawings):
     traces = page.get_texttrace()
     trace_index = {}
     all_counts = Counter()
@@ -211,7 +216,7 @@ def _extract_page(page, off_names, background, images, default_counts):
     matched = set()
     lines = []
     data = page.get_text("rawdict", sort=True)
-    for block in data["blocks"]:
+    for block_index, block in enumerate(data["blocks"]):
         if block.get("type") != 0:
             continue
         for line in block["lines"]:
@@ -248,7 +253,7 @@ def _extract_page(page, off_names, background, images, default_counts):
                         char.reason = "text is smaller than 2 pt and matches the rendered background"
                     chars.append(char)
             if chars:
-                lines.append(_Line(chars, tuple(line["bbox"])))
+                lines.append(_Line(chars, tuple(line["bbox"]), block_index))
     # Text wholly outside the CropBox is omitted by rawdict but can still occur in trace.
     extras = []
     for trace in traces:
@@ -271,11 +276,60 @@ def _extract_page(page, off_names, background, images, default_counts):
         if group:
             extras.append(group)
     try:
-        tables = list(page.find_tables().tables)
+        try:
+            tables = list(page.find_tables(use_layout=False, paths=drawings).tables)
+        except TypeError:
+            try:
+                tables = list(page.find_tables(paths=drawings).tables)
+            except TypeError:
+                if off_names:
+                    raise ValueError("table detection cannot safely isolate OFF-layer graphics")
+                tables = list(page.find_tables().tables)
     except (AttributeError, ValueError, RuntimeError) as exc:
         raise ValueError("table detection failed") from exc
+    _decorate(lines, drawings)
     return _Page(page.rect.width, page.rect.height, lines, images, tables,
-                 page.get_links(), not bool(lines)), extras
+                 page.get_links(), not bool(lines), drawings), extras
+
+
+def _decorate(lines, drawings):
+    """Recognize only thin horizontal marks whose ends coincide with a text run."""
+    marks = []
+    for drawing in drawings:
+        width = drawing.get("width") or 0
+        for item in drawing.get("items", []):
+            if item[0] == "l" and width <= 1.5:
+                start, end = item[1:3]
+                if abs(start.y - end.y) <= 0.5:
+                    marks.append((min(start.x, end.x), max(start.x, end.x), (start.y + end.y) / 2))
+            elif item[0] == "re" and drawing.get("fill") is not None:
+                box = _rect(item[1])
+                if box.height <= 1.5:
+                    marks.append((box.x0, box.x1, (box.y0 + box.y1) / 2))
+    for line in lines:
+        groups = []
+        for char in line.chars:
+            if char.technique:
+                continue
+            style = (char.font, char.size, char.flags, char.color)
+            if not groups or groups[-1][0] != style:
+                groups.append((style, []))
+            groups[-1][1].append(char)
+        for _, chars in groups:
+            if not chars:
+                continue
+            left, right = min(c.bbox[0] for c in chars), max(c.bbox[2] for c in chars)
+            baseline, size = chars[0].origin[1], chars[0].size
+            for x0, x1, y in marks:
+                if abs(x0 - left) > 2 or abs(x1 - right) > 2:
+                    continue
+                delta = y - baseline
+                if 0.03 * size <= delta <= 0.3 * size:
+                    for char in chars:
+                        char.underline = True
+                elif -0.45 * size <= delta <= -0.2 * size:
+                    for char in chars:
+                        char.strike = True
 
 
 def _normalized_positions(text):
@@ -390,6 +444,8 @@ def _write_runs(paragraph, chars, links):
         run.font.size = Pt(max(0.5, sample.size))
         run.bold = bool(sample.flags & 16 or "bold" in sample.font.lower())
         run.italic = bool(sample.flags & 2 or any(s in sample.font.lower() for s in ("italic", "oblique")))
+        run.underline = sample.underline
+        run.font.strike = sample.strike
         run.font.color.rgb = RGBColor((sample.color >> 16) & 255, (sample.color >> 8) & 255,
                                       sample.color & 255)
         if sample.background is not None and sample.background != (255, 255, 255):
@@ -413,7 +469,8 @@ def _write_runs(paragraph, chars, links):
                      _rect(item["from"]).intersects(_rect(char.bbox))), None)
         if char.color == 0xFFFFFF and char.background is None and char.text.strip():
             raise ValueError("cannot preserve light text on a varying background")
-        key = (char.font, char.size, char.flags, char.color, char.background, link)
+        key = (char.font, char.size, char.flags, char.color, char.background,
+               char.underline, char.strike, link)
         if previous is not None and previous != key:
             emit(current, previous[-1])
             current = []
@@ -447,16 +504,124 @@ def _repeated(pages):
             and round(line.bbox[0] / 5) == key[2] and round(line.bbox[1] / 5) == key[3]}
 
 
-def _paragraph_format(paragraph, line, page):
-    left, right = line.bbox[0], page.width-line.bbox[2]
-    if abs(left-right) < 10 and left > 50:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    elif right < left * 0.5:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+def _line_size(line):
+    sizes = [char.size for char in line.chars if not char.technique and char.text.strip()]
+    return max(sizes, default=0)
+
+
+def _baseline(line):
+    return next((char.origin[1] for char in line.chars if not char.technique and char.text.strip()),
+                line.bbox[3])
+
+
+def _columns(lines, page):
+    """Find clear, vertically overlapping text columns; otherwise return no columns."""
+    if page.tables or page.images or len(lines) < 4:
+        return []
+    groups = []
+    for line in sorted(lines, key=lambda item: item.bbox[0]):
+        found = next((group for group in groups if line.bbox[0] <= group[1] + 10 and
+                      line.bbox[2] >= group[0] - 10), None)
+        if found is None:
+            groups.append([line.bbox[0], line.bbox[2], [line]])
+        else:
+            found[0], found[1] = min(found[0], line.bbox[0]), max(found[1], line.bbox[2])
+            found[2].append(line)
+    groups.sort(key=lambda group: group[0])
+    if not 2 <= len(groups) <= 3 or any(len(group[2]) < 2 for group in groups):
+        return []
+    if any(b[0] - a[1] < 24 for a, b in pairwise(groups)):
+        return []
+    tops = [min(line.bbox[1] for line in group[2]) for group in groups]
+    bottoms = [max(line.bbox[3] for line in group[2]) for group in groups]
+    if max(tops) >= min(bottoms):
+        return []
+    ids = {id(line): index for index, group in enumerate(groups) for line in group[2]}
+    order = [ids[id(line)] for line in lines]
+    if order != sorted(order):
+        return []
+    return groups
+
+
+def _mergeable(group, line):
+    previous = group[-1][0]
+    size = _line_size(previous)
+    if not size or previous.block != line.block or abs(size - _line_size(line)) > 0.3:
+        return False
+    distance = _baseline(line) - _baseline(previous)
+    if not 0.8 * size <= distance <= 1.8 * size:
+        return False
+    reference = group[1][0].bbox[0] if len(group) > 1 else previous.bbox[0]
+    tolerance = 2 if len(group) > 1 else max(2, size * 1.8)
+    return abs(line.bbox[0] - reference) <= tolerance
+
+
+def _paragraph_format(paragraph, group, left, right, page_width=None, exact_single=False):
+    lines = [item[0] for item in group]
+    first = lines[0]
+    if len(lines) > 1 and max(line.bbox[2] for line in lines[:-1]) >= right - 12 and all(
+            abs(line.bbox[0] - lines[0].bbox[0]) <= 2 and line.bbox[2] >= right - 12
+            for line in lines[:-1]):
+        alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     else:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        if page_width is not None and len(lines) == 1:
+            lspace, rspace = first.bbox[0], page_width - first.bbox[2]
+        else:
+            lspace, rspace = first.bbox[0] - left, right - first.bbox[2]
+        if abs(lspace-rspace) < 10 and lspace > 10:
+            alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif rspace < lspace * 0.5:
+            alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        else:
+            alignment = WD_ALIGN_PARAGRAPH.LEFT
+    paragraph.alignment = alignment
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
+    if alignment == WD_ALIGN_PARAGRAPH.LEFT:
+        base = lines[1].bbox[0] if len(lines) > 1 else first.bbox[0]
+        paragraph.paragraph_format.left_indent = Pt(max(0, base - left))
+        paragraph.paragraph_format.right_indent = Pt(max(0, right - max(line.bbox[2] for line in lines)))
+        if len(lines) > 1:
+            paragraph.paragraph_format.first_line_indent = Pt(first.bbox[0] - base)
+    if len(lines) > 1:
+        distances = sorted(_baseline(b) - _baseline(a) for a, b in pairwise(lines))
+        paragraph.paragraph_format.line_spacing = Pt(distances[len(distances) // 2])
+    elif exact_single:
+        paragraph.paragraph_format.line_spacing = Pt(first.bbox[3] - first.bbox[1])
+
+
+def _anchor_picture(paragraph, image, box, behind=False):
+    run = paragraph.add_run()
+    run.add_picture(io.BytesIO(image), width=Pt(box.width), height=Pt(box.height))
+    inline = run._r.xpath("./w:drawing/wp:inline")[0]
+    anchor = OxmlElement("wp:anchor")
+    for name, value in {"distT": "0", "distB": "0", "distL": "0", "distR": "0",
+                        "simplePos": "0", "relativeHeight": "0", "behindDoc": str(int(behind)),
+                        "locked": "0", "layoutInCell": "1", "allowOverlap": "1"}.items():
+        anchor.set(name, value)
+    simple = OxmlElement("wp:simplePos")
+    simple.set("x", "0")
+    simple.set("y", "0")
+    anchor.append(simple)
+    # LibreOffice shifts an anchored image upward by one twip; compensate for
+    # that export rounding without changing the displayed image dimensions.
+    for tag, position in (("positionH", box.x0), ("positionV", box.y0 + 0.05)):
+        element = OxmlElement("wp:" + tag)
+        element.set("relativeFrom", "page")
+        offset = OxmlElement("wp:posOffset")
+        offset.text = str(int(Pt(position)))
+        element.append(offset)
+        anchor.append(element)
+    for child in list(inline):
+        inline.remove(child)
+        anchor.append(child)
+        if child.tag == qn("wp:extent"):
+            effect = OxmlElement("wp:effectExtent")
+            for side in ("l", "t", "r", "b"):
+                effect.set(side, "0")
+            anchor.append(effect)
+            anchor.append(OxmlElement("wp:wrapNone"))
+    inline.getparent().replace(inline, anchor)
 
 
 def _table_chars(page, box):
@@ -464,6 +629,124 @@ def _table_chars(page, box):
     return [[c for c in line.chars if not c.technique and rect.contains(
         pymupdf.Point((c.bbox[0]+c.bbox[2])/2, (c.bbox[1]+c.bbox[3])/2))]
             for line in page.lines]
+
+
+def _boundaries(values):
+    result = []
+    for value in sorted(values):
+        if not result or value - result[-1] > 2:
+            result.append(value)
+    return result
+
+
+def _drawing_rgb(color):
+    if not color:
+        return None
+    if len(color) == 1:
+        color = color * 3
+    if len(color) != 3:
+        return None
+    return "".join(f"{max(0, min(255, int(value * 255 + 0.5001))):02X}" for value in color)
+
+
+def _cell_appearance(cell, box, drawings):
+    """Keep a cell's solid fill and explicitly drawn, unambiguous borders."""
+    x0, y0, x1, y1 = box
+    fill = None
+    edges = {}
+    for drawing in drawings:
+        color = _drawing_rgb(drawing.get("fill"))
+        if color and drawing.get("fill_opacity", 1) > 0:
+            for item in drawing.get("items", []):
+                if item[0] == "re":
+                    area = _rect(item[1])
+                    if (area.x0 <= x0 + 1 and area.y0 <= y0 + 1 and
+                            area.x1 >= x1 - 1 and area.y1 >= y1 - 1):
+                        fill = color
+        color = _drawing_rgb(drawing.get("color"))
+        if color is None or drawing.get("stroke_opacity", 1) <= 0:
+            continue
+        width = max(2, min(96, round((drawing.get("width") or 0.25) * 8)))
+        segments = []
+        for item in drawing.get("items", []):
+            if item[0] == "l":
+                segments.append((item[1].x, item[1].y, item[2].x, item[2].y))
+            elif item[0] == "re":
+                rect = _rect(item[1])
+                segments.extend(((rect.x0, rect.y0, rect.x1, rect.y0),
+                                 (rect.x0, rect.y1, rect.x1, rect.y1),
+                                 (rect.x0, rect.y0, rect.x0, rect.y1),
+                                 (rect.x1, rect.y0, rect.x1, rect.y1)))
+        for ax, ay, bx, by in segments:
+            if abs(ay - by) <= 1 and min(ax, bx) <= x0 + 1 and max(ax, bx) >= x1 - 1:
+                if abs(ay-y0) <= 1:
+                    edges["top"] = color, width
+                if abs(ay-y1) <= 1:
+                    edges["bottom"] = color, width
+            if abs(ax - bx) <= 1 and min(ay, by) <= y0 + 1 and max(ay, by) >= y1 - 1:
+                if abs(ax-x0) <= 1:
+                    edges["left"] = color, width
+                if abs(ax-x1) <= 1:
+                    edges["right"] = color, width
+    props = cell._tc.get_or_add_tcPr()
+    if fill:
+        shade = OxmlElement("w:shd")
+        shade.set(qn("w:val"), "clear")
+        shade.set(qn("w:fill"), fill)
+        props.append(shade)
+    borders = OxmlElement("w:tcBorders")
+    for side in ("top", "left", "bottom", "right"):
+        border = OxmlElement("w:" + side)
+        if side in edges:
+            color, width = edges[side]
+            border.set(qn("w:val"), "single")
+            border.set(qn("w:color"), color)
+            border.set(qn("w:sz"), str(width))
+        else:
+            border.set(qn("w:val"), "nil")
+        borders.append(border)
+    props.append(borders)
+
+
+def _insert_table(doc, page, table):
+    boxes = [box for row in table.rows for box in row.cells if box is not None]
+    if not boxes:
+        raise ValueError("table geometry is incomplete")
+    xs = _boundaries([value for box in boxes for value in (box[0], box[2])])
+    ys = _boundaries([value for box in boxes for value in (box[1], box[3])])
+    if len(xs) < 2 or len(ys) < 2:
+        raise ValueError("table grid cannot be resolved")
+    word = doc.add_table(rows=len(ys) - 1, cols=len(xs) - 1)
+    word.autofit = False
+    word.style = "Table Grid"
+    for col, (a, b) in enumerate(pairwise(xs)):
+        word.columns[col].width = Pt(b - a)
+        for row in word.rows:
+            row.cells[col].width = Pt(b - a)
+    body = []
+    for box in sorted(boxes, key=lambda item: (item[1], item[0])):
+        x0, y0, x1, y1 = box
+        c0 = min(range(len(xs)), key=lambda i: abs(xs[i] - x0))
+        c1 = min(range(len(xs)), key=lambda i: abs(xs[i] - x1))
+        r0 = min(range(len(ys)), key=lambda i: abs(ys[i] - y0))
+        r1 = min(range(len(ys)), key=lambda i: abs(ys[i] - y1))
+        if c1 <= c0 or r1 <= r0:
+            raise ValueError("table cell span is ambiguous")
+        cell = word.cell(r0, c0)
+        if c1 - c0 > 1 or r1 - r0 > 1:
+            cell = cell.merge(word.cell(r1 - 1, c1 - 1))
+        _cell_appearance(cell, box, page.drawings)
+        p = cell.paragraphs[0]
+        texts = []
+        for chars in _table_chars(page, box):
+            if not chars:
+                continue
+            if texts:
+                p.add_run(" ")
+            _write_runs(p, chars, page.links)
+            texts.append("".join(c.text for c in chars))
+        body.append(" ".join(texts))
+    return body
 
 
 def _render_document(pages, dest):
@@ -483,12 +766,32 @@ def _render_document(pages, dest):
         right = min([page.width-box[2] for box in boxes] or [30])
         top = min([box[1] for box in boxes] or [30])
         bottom = min([page.height-box[3] for box in boxes] or [30])
-        section.left_margin, section.right_margin = Pt(max(0, left)), Pt(max(0, right))
-        section.top_margin = Pt(max(0, top))
-        # Keep reflow headroom even when the original page has a large blank bottom.
-        section.bottom_margin = Pt(max(0, min(30, bottom)))
+        columns = _columns(active, page)
+        tight_margins = (len(active) == 1 and not page.images and not page.tables and
+                         not any(c.technique for c in active[0].chars) and not any(
+                             entry[0] == index for entry in repeated))
+        # Tight margins are safe for a single line with exact line spacing. More
+        # complex pages need headroom to prevent Word from adding a page or wrap.
+        section.left_margin = Pt(max(0, left))
+        section.right_margin = Pt(max(0, right if tight_margins else right - 4))
+        first = min(active, key=lambda line: line.bbox[1]) if active else None
+        if not tight_margins and first is not None and abs(first.bbox[1] - top) < 1:
+            # Word's baseline in an ordinary paragraph is approximately 15/16 em
+            # below the top margin; source bbox ascenders vary by PDF font.
+            top_margin = _baseline(first) - _line_size(first) * 0.9375
+        else:
+            top_margin = top
+        section.top_margin = Pt(max(0, top_margin))
+        section.bottom_margin = Pt(max(0, bottom if tight_margins else min(30, bottom)))
+        section.header_distance = Pt(0)
+        section.footer_distance = Pt(0)
         section.header.is_linked_to_previous = False
         section.footer.is_linked_to_previous = False
+        if columns:
+            cols = section._sectPr.find(qn("w:cols"))
+            cols.set(qn("w:num"), str(len(columns)))
+            gap = min(b[0] - a[1] for a, b in pairwise(columns))
+            cols.set(qn("w:space"), str(int(gap * 20)))
         headers, footers = [], []
         for line in page.lines:
             for kind, area, texts in (("header", section.header, headers),
@@ -497,40 +800,92 @@ def _render_document(pages, dest):
                     p = area.paragraphs[0] if not texts else area.add_paragraph()
                     _write_runs(p, line.chars, page.links)
                     texts.append(_line_text(line))
+                    if kind == "header":
+                        section.header_distance = Pt(max(0, line.bbox[1]))
+                    else:
+                        section.footer_distance = Pt(max(0, page.height-line.bbox[3]))
         table_boxes = [tuple(table.bbox) for table in page.tables]
         items = []
-        for line in page.lines:
-            if any((index, id(line), kind) in repeated for kind in ("header", "footer")):
-                continue
+        for line in active:
             chars = [c for c in line.chars if not c.technique and not any(
                 _rect(box).contains(pymupdf.Point((c.bbox[0]+c.bbox[2])/2,
                                                   (c.bbox[1]+c.bbox[3])/2))
                 for box in table_boxes)]
             if chars and "".join(c.text for c in chars).strip():
-                items.append((line.bbox[1], line.bbox[0], "line", (line, chars)))
-        items.extend((box[1], box[0], "table", table)
+                col = next((n for n, group in enumerate(columns) if line in group[2]), 0)
+                items.append((col, line.bbox[1], line.bbox[0], "line", (line, chars)))
+        items.extend((0, box[1], box[0], "table", table)
                      for box, table in zip(table_boxes, page.tables))
-        items.extend((image["bbox"][1], image["bbox"][0], "image", image)
-                     for image in page.images)
-        body = []
-        previous_bottom = top
-        for item_top, _, kind, item in sorted(items, key=lambda value: value[:2]):
+        floating = []
+        for image in page.images:
+            box = _rect(image["bbox"])
+            full_page = not active and len(page.images) == 1 and box.x0 <= 1 and box.y0 <= 1 and (
+                box.x1 >= page.width - 1 and box.y1 >= page.height - 1)
+            nearby = [line for line in active if box.y0 < line.bbox[3] and box.y1 > line.bbox[1]]
+            beside = bool(nearby) and all(box.x1 <= line.bbox[0] or box.x0 >= line.bbox[2]
+                                          for line in nearby)
+            if beside and (any(box.intersects(_rect(t)) for t in table_boxes) or any(
+                    other is not image and box.intersects(_rect(other["bbox"]))
+                    for other in page.images)):
+                beside = False
+            if full_page or beside:
+                floating.append((image, box, full_page))
+            else:
+                items.append((0, box.y0, box.x0, "image", image))
+        items.sort(key=lambda value: value[:3])
+        body, groups = [], []
+        for col, y, x, kind, item in items:
+            if kind == "line" and groups and groups[-1][3] == "line" and groups[-1][0] == col and (
+                    _mergeable(groups[-1][4], item[0])):
+                groups[-1][4].append(item)
+            else:
+                groups.append([col, y, x, kind, [item] if kind == "line" else item])
+        previous_bottom, previous_col, first_paragraph = top, 0, None
+        joined_lines = set()
+        for col, item_top, _, kind, item in groups:
+            if col != previous_col:
+                if first_paragraph is None:
+                    raise ValueError("column break has no preceding paragraph")
+                doc.paragraphs[-1].add_run().add_break(WD_BREAK.COLUMN)
+                previous_bottom = top
+                previous_col = col
             gap = max(0, item_top - previous_bottom)
             if kind == "line":
-                line, chars = item
+                group = item
                 paragraph = doc.add_paragraph()
-                _paragraph_format(paragraph, line, page)
+                first_paragraph = first_paragraph or paragraph
+                col_left = columns[col][0] if columns else left
+                col_right = columns[col][1] if columns else page.width - right
+                _paragraph_format(paragraph, group, col_left, col_right,
+                                  page.width if not columns else None,
+                                  len(active) > 1 or tight_margins)
+                if tight_margins:
+                    current = paragraph.paragraph_format.right_indent
+                    paragraph.paragraph_format.right_indent = Pt((current.pt if current else 0) - 4)
                 paragraph.paragraph_format.space_before = Pt(gap)
-                if paragraph.alignment == WD_ALIGN_PARAGRAPH.LEFT:
-                    paragraph.paragraph_format.left_indent = Pt(max(0, line.bbox[0] - left))
-                _write_runs(paragraph, chars, page.links)
-                previous_bottom = max(previous_bottom, line.bbox[3])
-                body.append("".join(c.text for c in chars))
+                for position, (line, chars) in enumerate(group):
+                    text = "".join(c.text for c in chars)
+                    joined = False
+                    if position:
+                        previous_line, previous_chars = group[position - 1]
+                        previous_text = "".join(c.text for c in previous_chars)
+                        joined = bool(previous_text.endswith(("-", "‐", "‑")) and text and
+                                      text[0].isalpha())
+                        paragraph.add_run("" if joined else " ").add_break()
+                        if joined:
+                            joined_lines.add((id(previous_line), id(line)))
+                    _write_runs(paragraph, chars, page.links)
+                    if joined:
+                        body[-1] += text
+                    else:
+                        body.append(text)
+                previous_bottom = max(previous_bottom, group[-1][0].bbox[3])
             elif kind == "image":
                 if not item.get("data"):
                     raise ValueError("page image cannot be extracted safely")
                 box = _rect(item["bbox"])
                 paragraph = doc.add_paragraph()
+                first_paragraph = first_paragraph or paragraph
                 paragraph.paragraph_format.space_before = Pt(gap)
                 paragraph.paragraph_format.space_after = Pt(0)
                 paragraph.paragraph_format.left_indent = Pt(max(0, box.x0 - left))
@@ -538,39 +893,30 @@ def _render_document(pages, dest):
                                                 width=Pt(box.width), height=Pt(box.height))
                 previous_bottom = max(previous_bottom, box.y1)
             else:
-                table = item
-                previous_bottom = max(previous_bottom, table.bbox[3])
-                if not table.rows or not table.rows[0].cells:
-                    raise ValueError("table geometry is incomplete")
-                cells = table.rows[0].cells
-                columns = []
-                for column, box in enumerate(cells):
-                    if box is None:
-                        raise ValueError("merged PDF table cells are unsupported")
-                    # MuPDF can expose the two edges of one stroked line as an empty column.
-                    empty = all(not any(_table_chars(page, row.cells[column]))
-                                for row in table.rows if row.cells[column] is not None)
-                    if _rect(box).width > 3 or not empty:
-                        columns.append(column)
-                word = doc.add_table(rows=len(table.rows), cols=len(columns))
-                for row_index, row in enumerate(table.rows):
-                    for col_index, column in enumerate(columns):
-                        box = row.cells[column]
-                        if box is None:
-                            raise ValueError("merged PDF table cells are unsupported")
-                        lines = _table_chars(page, box)
-                        p = word.cell(row_index, col_index).paragraphs[0]
-                        texts = []
-                        for chars in lines:
-                            if not chars:
-                                continue
-                            if texts:
-                                p.add_run(" ")
-                            _write_runs(p, chars, page.links)
-                            texts.append("".join(c.text for c in chars))
-                        body.append(" ".join(texts))
+                previous_bottom = max(previous_bottom, item.bbox[3])
+                body.extend(_insert_table(doc, page, item))
+        if floating:
+            if first_paragraph is None:
+                first_paragraph = doc.add_paragraph()
+                first_paragraph.paragraph_format.space_before = Pt(0)
+                first_paragraph.paragraph_format.space_after = Pt(0)
+                first_paragraph.paragraph_format.line_spacing = Pt(1)
+            for image, box, full_page in floating:
+                if not image.get("data"):
+                    raise ValueError("page image cannot be extracted safely")
+                _anchor_picture(first_paragraph, image["data"], box, behind=full_page)
         page_text = _normalized(" ".join([*headers, *body, *footers]))
-        original_text = _normalized(" ".join(_line_text(line) for line in page.lines))
+        original_parts, previous_line = [], None
+        for line in page.lines:
+            text = _line_text(line)
+            if not text.strip():
+                continue
+            if previous_line is not None and (id(previous_line), id(line)) in joined_lines:
+                original_parts[-1] += text
+            else:
+                original_parts.append(text)
+            previous_line = line
+        original_text = _normalized(" ".join(original_parts))
         if page_text != original_text:
             raise ValueError("PDF reading order or visible text changed during reconstruction")
         expected.append(page_text)
@@ -679,7 +1025,7 @@ def pdf_to_docx(src: Path, dest: Path, *, workdir: Path,
             with pymupdf.open(src) as original:
                 if not original.is_pdf or original.needs_pass or not len(original):
                     raise ValueError("PDF is empty, encrypted or invalid")
-                visible_images, default_traces = [], []
+                visible_images, default_traces, visible_drawings = [], [], []
                 for page in original:
                     if page.rotation:
                         raise ValueError("page rotation cannot be mapped safely")
@@ -687,6 +1033,7 @@ def pdf_to_docx(src: Path, dest: Path, *, workdir: Path,
                                                   for trace in page.get_texttrace()
                                                   for code, _gid, origin, _bbox in trace["chars"]))
                     images = page.get_image_info(xrefs=True)
+                    visible_drawings.append(page.get_drawings())
                     for image in images:
                         extracted = original.extract_image(image.get("xref", 0))
                         image["data"] = extracted.get("image") if extracted else None
@@ -698,7 +1045,7 @@ def pdf_to_docx(src: Path, dest: Path, *, workdir: Path,
                     pix = background[number].get_pixmap(matrix=pymupdf.Matrix(2, 2),
                                                         colorspace=pymupdf.csRGB, alpha=False)
                     item, outliers = _extract_page(page, off_names, pix, visible_images[number],
-                                                   default_traces[number])
+                                                   default_traces[number], visible_drawings[number])
                     pages.append(item)
                     extra.append(outliers)
                 link_actions = _validate_spans(pages, hidden_regions or [], injection_spans or [])
@@ -721,8 +1068,9 @@ def pdf_to_docx(src: Path, dest: Path, *, workdir: Path,
             converted_dir = root / "converted"
             converted_dir.mkdir()
             run_tool([executable, f"-env:UserInstallation={(root / 'profile').as_uri()}",
-                      "--headless", "--convert-to", "pdf", "--outdir", str(converted_dir),
-                      str(candidate)], ctx,
+                      "--headless", "--convert-to",
+                      'pdf:writer_pdf_Export:{"UseLosslessCompression":{"type":"boolean","value":"true"}}',
+                      "--outdir", str(converted_dir), str(candidate)], ctx,
                      extra_env={"XDG_CONFIG_HOME": str(root / "config"),
                                 "XDG_CACHE_HOME": str(root / "cache")}, ok_codes=(0,))
             converted = converted_dir / f"{candidate.stem}.pdf"
