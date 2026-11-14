@@ -19,7 +19,7 @@ _IA = r"(?:i\s*\.?\s*a\.?|inteligencia[\s_-]+artificial|lenguaje)"
 # contextual: it is included only when family A also occurs in that channel.
 _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in (
     ("ai_addressed_es", "a", (rf"\bsi{_SEP}eres{_SEP}(?:una|un){_SEP}"
-        rf"(?:{_IA}|modelo(?:{_SEP}(?:de{_SEP})?{_IA})?|"
+        rf"(?:{_IA}|modelo{_SEP}(?:de{_SEP})?{_IA}|"
         rf"(?:herramienta|asistente|sistema|programa|chatbot|agente){_SEP}"
         rf"(?:de{_SEP})?{_IA})(?!\w)")),
     ("ai_passive_es", "a", (rf"\bsi{_SEP}(?:este{_SEP}documento{_SEP})?"
@@ -38,8 +38,11 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
     ("disregard_en", "b", rf"\bdisregard(?:{_SEP}[a-z]+){{0,6}}{_SEP}instructions\b"),
     ("forget_en", "b", rf"\bforget{_SEP}(?:everything|all){_SEP}(?:above|before)\b"),
     ("system_prompt", "c", rf"\bsystem{_SEP}prompt\b"),
-    ("role_es", "c", rf"\beres{_SEP}ahora\b"),
-    ("role_en", "c", rf"\byou{_SEP}are{_SEP}now\b"),
+    # Role hijack needs a target role; "eres ahora mayor de edad" is ordinary prose.
+    ("role_es", "c", (rf"\b(?:eres{_SEP}ahora|ahora{_SEP}eres){_SEP}(?:un|una|el|la){_SEP}"
+        rf"(?:[a-z]+{_SEP}){{0,2}}?(?:{_IA}|asistente|modelo|agente|chatbot|bot|sistema)(?!\w)")),
+    ("role_en", "c", (rf"\byou{_SEP}are{_SEP}now{_SEP}(?:(?:an?|the){_SEP})?"
+        rf"(?:[a-z]+{_SEP}){{0,2}}?(?:ai|assistant|model|chatbot|agent|bot|dan)\b")),
     ("new_instructions_en", "c", rf"\bnew{_SEP}instructions\s*:"),
     ("new_instructions_es", "c", rf"\bnuevas{_SEP}instrucciones\s*:"),
     ("system_token", "c", r"\[system\]"),
@@ -55,11 +58,12 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
     ("exfiltration_es", "e", rf"\b(?:envia|envie){_SEP}"),
     ("markdown_image", "e", r"!\["),
 ))
+_EMAIL = r"[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8}"  # bounded: no backtracking blowup
 # Separate prefix and destination searches avoid quadratic backtracking on a
 # hostile channel containing many exfiltration prefixes but no destination.
 _EXFIL_DESTINATIONS = {
-    "exfiltration_en": re.compile(rf"\bto{_SEP}(?:https?\b|www\b)"),
-    "exfiltration_es": re.compile(rf"\ba{_SEP}(?:https?\b|www\b)"),
+    "exfiltration_en": re.compile(rf"\bto{_SEP}(?:https?\b|www\b|{_EMAIL})"),
+    "exfiltration_es": re.compile(rf"\ba{_SEP}(?:https?\b|www\b|{_EMAIL})"),
     "markdown_image": re.compile(r"\]\(\s*https?\b"),
 }
 
