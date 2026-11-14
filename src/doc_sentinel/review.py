@@ -363,6 +363,7 @@ def merge(root: Path, plan: dict, original: dict, *,
           include_sanitize_provenance: bool = False) -> tuple[dict, int]:
     report = copy.deepcopy(original)
     errors, semantic, sanitize_origins = [], [], []
+    source_findings = {item["finding_id"]: item for item in original["findings"]}
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     answers_fd = None
     directory_status = None
@@ -407,7 +408,8 @@ def merge(root: Path, plan: dict, original: dict, *,
                     continue
                 for origin in origins[answer["task_id"]]:
                     if label == "injection":
-                        sanitize_origins.append({"task_id": answer["task_id"], "origin": origin})
+                        sanitize_origins.append({"task_id": answer["task_id"], "origin": origin,
+                                                 "source_finding": source_findings.get(origin["finding_id"])})
                     hidden = origin["hidden"] or origin["channel"] != "body"
                     severity = ("info" if label == "unsure" else
                                 "critical" if hidden and score >= 0.9 else

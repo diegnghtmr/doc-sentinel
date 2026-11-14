@@ -491,6 +491,86 @@ def test_renderer_difference_refuses_without_publishing(workspace, monkeypatch):
     assert not dest.exists()
 
 
+@pytest.mark.parametrize("size", [1, 2, 3])
+def test_hidden_white_inline_reflow_preserves_rendered_text(workspace, size):
+    doc = Document()
+    p = doc.add_paragraph("Visible beginning ")
+    run = p.add_run("x")
+    run.font.size = Pt(size)
+    run.font.color.rgb = RGBColor(255, 255, 255)
+    p.add_run("end.")
+    src = _source(workspace, doc)
+    result, dest = _run(workspace, src)
+    _passed(result)
+    check = result.checks["render_equal"]
+    assert check["mode"] == "equivalent_with_reflow"
+    assert check["similarity"] and all(score >= 0.97 for score in check["similarity"])
+    assert _body(dest) == "Visible beginning end."
+
+
+def test_reflow_never_accepts_a_planner_removing_visible_text(workspace, monkeypatch):
+    from doc_sentinel.sanitize import docx as impl
+
+    doc = Document()
+    p = doc.add_paragraph("Visible text that must stay. ")
+    p.add_run("hidden").font.hidden = True
+    src = _source(workspace, doc)
+    plan = impl._plan
+
+    def incorrect_plan(roots, entries, spans):
+        patches, visible = plan(roots, entries, spans)
+        streams = impl._streams(roots, entries, patches)
+        for stream in streams:
+            text = "".join(atom.char for atom in stream.atoms)
+            start = text.find("Visible")
+            if stream.channel == "body" and start >= 0:
+                patches.extend(impl._atom_patches(stream.part, stream.atoms[start:start + 7],
+                                                  "hidden-run", "hidden", "incorrect planner"))
+        patches.sort(key=lambda item: (item.part, item.start))
+        return patches, visible
+
+    monkeypatch.setattr(impl, "_plan", incorrect_plan)
+    result, dest = _run(workspace, src)
+    assert result.status == "refused" and result.checks["render_equal"]["status"] == "failed"
+    assert not dest.exists()
+
+
+def test_hidden_page_break_cannot_reflow_to_a_different_page_count(workspace):
+    from docx.enum.text import WD_BREAK
+
+    doc = Document()
+    p = doc.add_paragraph("First page.")
+    run = p.add_run("hidden")
+    run.font.size = Pt(2)
+    run.font.color.rgb = RGBColor(255, 255, 255)
+    run.add_break(WD_BREAK.PAGE)
+    p.add_run("Second page.")
+    src = _source(workspace, doc)
+    result, dest = _run(workspace, src)
+    assert result.status == "refused" and result.checks["render_equal"]["status"] == "failed"
+    assert "page count" in result.refusal_reason and not dest.exists()
+
+
+def test_reflow_rejects_similarity_below_threshold(workspace, monkeypatch):
+    from doc_sentinel.sanitize import pdf_to_docx
+
+    doc = Document()
+    p = doc.add_paragraph("Visible beginning " + "ordinary words " * 12)
+    run = p.add_run("hidden synthetic words " * 12)
+    run.font.size = Pt(2)
+    run.font.color.rgb = RGBColor(255, 255, 255)
+    p.add_run("visible ending " + "ordinary words " * 12)
+    src = _source(workspace, doc)
+    calls = []
+    def low_similarity(*_args):
+        calls.append(True)
+        return {"pages": [{"page": 1, "similarity": 0.969}], "source_pages": 1, "output_pages": 1}
+    monkeypatch.setattr(pdf_to_docx, "_similarity", low_similarity)
+    result, dest = _run(workspace, src)
+    assert result.status == "refused" and result.checks["render_equal"]["status"] == "failed"
+    assert calls and not dest.exists()
+
+
 def test_missing_libreoffice_refuses_without_publishing(workspace, monkeypatch):
     from doc_sentinel.sanitize import docx as impl
 
@@ -534,3 +614,36 @@ def test_vml_and_drawingml_textboxes_remove_hidden_text(workspace):
     _passed(result)
     assert "secret" not in _body(dest)
     assert {a["removed_text"] for a in result.actions} == {"vml secret", "drawing secret"}
+
+
+# L50: rendered-text check for reflow compares character multisets, so a block-order or
+# span-split difference in the PDF text layer cannot cause a false refusal, while any
+# visible character lost (or added) still refuses.
+from doc_sentinel.sanitize.docx import _render_delta_ok
+
+
+def test_render_delta_accepts_exact_hidden_removal_in_any_order():
+    original = "Visible uno. OCULTO texto. Visible dos."
+    candidate = "Visible dos. Visible uno."
+    assert _render_delta_ok(original, candidate, ["OCULTO texto."])
+
+
+def test_render_delta_refuses_lost_visible_character():
+    original = "Visible uno. OCULTO. Visible dos."
+    candidate = "Visible uno. Visible do."
+    assert not _render_delta_ok(original, candidate, ["OCULTO."])
+
+
+def test_render_delta_refuses_added_character():
+    assert not _render_delta_ok("abc OCULTO", "abcd", ["OCULTO"])
+
+
+def test_render_delta_ignores_line_end_hyphenation():
+    original = "instrucciones visibles OCULTO"
+    candidate = "instruc- ciones visibles"
+    assert _render_delta_ok(original, candidate, ["OCULTO"])
+
+
+def test_render_delta_allows_hidden_text_that_was_never_rendered():
+    # w:vanish text may not be painted by LibreOffice at all.
+    assert _render_delta_ok("Visible.", "Visible.", ["no pintado"])

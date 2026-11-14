@@ -4,9 +4,9 @@
 usage() {
     printf '%s\n' \
         'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,sanitize,review-merge,version,intent} ...' \
-        '  clean FILE [-o PATH] [--force-output] [--json|--agent-summary] [--report PATH]' \
-        '  detect FILE [--sanitize [-o PATH] [--force-output]] [--agent-summary] [--review-dir DIR]' \
-        '  sanitize FILE --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]' \
+        '  clean FILE [-o PATH | --output-dir DIR] [--force-output] [--json|--agent-summary] [--report PATH]' \
+        '  detect FILE [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--agent-summary] [--review-dir DIR]' \
+        '  sanitize FILE --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]' \
         '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'  \
         '  version | intent TEXT...' \
         '  update and --allow-network require the Python CLI on the host.'
@@ -36,18 +36,19 @@ case "$1" in
     *) fail "unknown command: $1" ;;
 esac
 
-input=''; output=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''; sanitized=0
+input=''; output=''; output_dir=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''; sanitized=0
 [ "$mode" != sanitize ] || sanitized=1
 if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
             --allow-network|--allow-network=*) fail '--allow-network is not available in the container launcher' ;;
-            -o|--output|--report|--fail-on|--review-dir)
+            -o|--output|--output-dir|--report|--fail-on|--review-dir)
                 option=$1; shift
                 [ "$#" -gt 0 ] && [ -n "$1" ] || fail "missing value for $option"
                 case "$option" in
                     -o|--output) [ "$mode" != review-merge ] || fail "unknown option: $option"; output=$1 ;;
+                    --output-dir) [ "$mode" != review-merge ] || fail "unknown option: $option"; output_dir=$1 ;;
                     --report) report=$1 ;;
                     --review-dir) [ "$mode" != clean ] || fail "unknown option: $option"; review=$1 ;;
                     --fail-on) [ "$mode" = detect ] || fail "unknown option: $option"; fail_on=$1 ;;
@@ -56,6 +57,7 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
                 [ "$mode" != review-merge ] || fail "unknown option: $1"
                 case "$1" in --output=*) output=${1#--output=} ;; *) output=${1#-o} ;; esac
                 [ -n "$output" ] || fail 'missing value for --output' ;;
+            --output-dir=*) [ "$mode" != review-merge ] || fail "unknown option: $1"; output_dir=${1#--output-dir=}; [ -n "$output_dir" ] || fail 'missing value for --output-dir' ;;
             --report=*) report=${1#--report=}; [ -n "$report" ] || fail 'missing value for --report' ;;
             --review-dir=*) [ "$mode" != clean ] || fail "unknown option: $1"; review=${1#--review-dir=}; [ -n "$review" ] || fail 'missing value for --review-dir' ;;
             --fail-on=*) [ "$mode" = detect ] || fail "unknown option: $1"; fail_on=${1#--fail-on=}; [ -n "$fail_on" ] || fail 'missing value for --fail-on' ;;
@@ -74,7 +76,8 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
         shift
     done
     [ "$json" -eq 0 ] || [ "$agent" -eq 0 ] || fail '--json and --agent-summary are mutually exclusive'
-    if [ "$mode" = detect ] && [ "$sanitized" -eq 0 ] && { [ -n "$output" ] || [ "$force" -eq 1 ]; }; then
+    [ -z "$output" ] || [ -z "$output_dir" ] || fail '--output and --output-dir are mutually exclusive'
+    if [ "$mode" = detect ] && [ "$sanitized" -eq 0 ] && { [ -n "$output" ] || [ -n "$output_dir" ] || [ "$force" -eq 1 ]; }; then
         fail '--output and --force-output require --sanitize'
     fi
     if [ "$mode" = sanitize ] && [ -z "$review" ]; then fail 'sanitize requires --review-dir'; fi
@@ -104,30 +107,20 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
         fi
     fi
     if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
-        suffix=cleaned
-        [ "$sanitized" -eq 0 ] || suffix=sanitized
-        if [ -z "$output" ]; then
-            case "$in_name" in
-                .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.$suffix" ;; *) out_name="${in_name%.*}.$suffix.${in_name##*.}" ;; esac ;;
-                *) out_name="$in_name.$suffix" ;;
-            esac
-            if [ "$sanitized" -eq 1 ] && LC_ALL=C head -c 1024 "$input" | LC_ALL=C grep -q '%PDF-'; then
-                stem=$in_name
-                case "$in_name" in
-                    .*.*|?*.*) case "$in_name" in *.) ;; *) stem=${in_name%.*} ;; esac ;;
-                esac
-                out_name="$stem.sanitized.docx"
-            fi
-            output=$in_dir/$out_name
+        if [ -n "$output" ]; then
+            output=$(resolve_path "$output") || fail 'output directory does not exist'
+            same_path "$input" "$output" && fail 'output path must differ from the input (no in-place cleaning)'
+            out_dir=$(dirname "$output"); out_name=$(basename "$output")
+        else
+            [ -n "$output_dir" ] || output_dir=$in_dir
+            [ -d "$output_dir" ] || fail 'output directory does not exist'
+            out_dir=$(realpath "$output_dir") || fail 'output directory does not exist'
         fi
-        output=$(resolve_path "$output") || fail 'output directory does not exist'
-        same_path "$input" "$output" && fail 'output path must differ from the input (no in-place cleaning)'
-        out_dir=$(dirname "$output"); out_name=$(basename "$output")
     fi
     if [ -n "$report" ]; then
         report=$(resolve_path "$report") || fail 'report directory does not exist'
         if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
-            if same_path "$report" "$input" || same_path "$report" "$output"; then
+            if same_path "$report" "$input" || { [ -n "$output" ] && same_path "$report" "$output"; }; then
                 fail 'report path must differ from the input and the output document'
             fi
         elif [ -n "$input" ] && same_path "$report" "$input"; then
@@ -169,7 +162,11 @@ fi
 if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     if [ "$mode" = review-merge ]; then set -- "$mode"; else set -- "$mode" "/work/in/$in_name"; fi
     if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
-        set -- "$@" -o "/work/out/$out_name"
+        if [ -n "$output" ]; then
+            set -- "$@" -o "/work/out/$out_name"
+        else
+            set -- "$@" --output-dir /work/out
+        fi
         [ "$force" -eq 0 ] || set -- "$@" --force-output
     fi
     [ "$json" -eq 0 ] || set -- "$@" --json
@@ -201,6 +198,9 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
         [ -z "$review" ] || set -- -e "DOC_SENTINEL_HOST_REVIEW=$review" "$@"
         [ -z "$report" ] || set -- -e "DOC_SENTINEL_HOST_REPORT=$report" "$@"
         [ -z "$output" ] || set -- -e "DOC_SENTINEL_HOST_OUTPUT=$output" "$@"
+        if { [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; } && [ -z "$output" ]; then
+            set -- -e "DOC_SENTINEL_HOST_OUTPUT_DIR=$out_dir" "$@"
+        fi
         [ -z "$input" ] || set -- -e "DOC_SENTINEL_HOST_INPUT=$input_given" "$@"
     fi
 fi
@@ -209,5 +209,5 @@ set -- run --rm --network=none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g 
     --cap-drop=ALL --security-opt=no-new-privileges -e DOC_SENTINEL_NO_NETNS=1 "$@"
 docker "$@"
 code=$?
-if [ "$mode" = clean ] && [ "$code" -eq 0 ]; then printf 'Cleaned copy: %s\n' "$output" >&2; fi
+if [ "$mode" = clean ] && [ "$code" -eq 0 ] && [ -n "$output" ]; then printf 'Cleaned copy: %s\n' "$output" >&2; fi
 exit "$code"

@@ -112,13 +112,10 @@ def harness():
 class LauncherScenarios:
     def test_clean_default_output_and_paths_with_spaces(self, harness):
         result = harness.run("clean", harness.input, "--json")
-        output = harness.input_dir / "informe final.cleaned.docx"
-        assert (result.returncode, result.stdout, result.stderr) == (
-            0, "", f"Cleaned copy: {harness.path(output)}\n")
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
         args = harness.assert_base(harness.run_args(), [
             (harness.input_dir, "/work/in", "ro"), (harness.input_dir, "/work/out", "rw")])
-        assert args == ["clean", "/work/in/informe final.docx", "-o",
-                        "/work/out/informe final.cleaned.docx", "--json"]
+        assert args == ["clean", "/work/in/informe final.docx", "--output-dir", "/work/out", "--json"]
         assert harness.input.read_bytes() == b"synthetic input, unchanged"
 
     def test_clean_custom_output_and_separate_report(self, harness):
@@ -224,9 +221,8 @@ class LauncherScenarios:
         result = harness.run(*args)
         assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
         recorded = harness.run_args()
-        output = harness.input_dir / "source file.sanitized.docx"
-        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(output)}" in recorded
-        assert "/work/out/source file.sanitized.docx" in recorded
+        assert f"DOC_SENTINEL_HOST_OUTPUT_DIR={harness.path(harness.input_dir)}" in recorded
+        assert "--output-dir" in recorded and "/work/out" in recorded
         assert src.read_bytes() == b"%PDF-1.7\nsynthetic PDF input"
 
     @pytest.mark.parametrize("mode", ["detect", "sanitize"])
@@ -245,16 +241,38 @@ class LauncherScenarios:
         result = harness.run(*args)
         assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
         recorded = harness.run_args()
-        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(harness.input_dir / output)}" in recorded
-        assert f"/work/out/{output}" in recorded and src.read_bytes() == data
+        assert f"DOC_SENTINEL_HOST_OUTPUT_DIR={harness.path(harness.input_dir)}" in recorded
+        assert "--output-dir" in recorded and "/work/out" in recorded and src.read_bytes() == data
 
     def test_clean_agent_summary_is_forwarded(self, harness):
         result = harness.run("clean", harness.input, "--agent-summary")
         assert result.returncode == 0
         args = harness.assert_base(harness.run_args(), [
             (harness.input_dir, "/work/in", "ro"), (harness.input_dir, "/work/out", "rw")])
-        assert args == ["clean", "/work/in/informe final.docx", "-o",
-                        "/work/out/informe final.cleaned.docx", "--agent-summary"]
+        assert args == ["clean", "/work/in/informe final.docx", "--output-dir", "/work/out", "--agent-summary"]
+
+    @pytest.mark.parametrize("mode", ["clean", "detect", "sanitize"])
+    def test_custom_output_dir_is_mounted_and_passed_to_cli(self, harness, mode):
+        review = harness.report_dir / "review"
+        review.mkdir()
+        args = [mode, harness.input, "--output-dir", harness.output_dir, "--agent-summary"]
+        if mode == "detect":
+            args.append("--sanitize")
+        elif mode == "sanitize":
+            args.extend(["--review-dir", review])
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_OUTPUT_DIR={harness.path(harness.output_dir)}" in recorded
+        assert "--output-dir" in recorded and "/work/out" in recorded
+        assert f"{harness.path(harness.output_dir)}:/work/out:rw" in recorded
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    def test_output_dir_and_output_are_mutually_exclusive(self, harness):
+        output = harness.output_dir / "output.docx"
+        result = harness.run("clean", harness.input, "-o", output, "--output-dir", harness.output_dir)
+        assert result.returncode == 2 and result.stdout == "" and "mutually exclusive" in result.stderr
+        assert not output.exists() and not harness.calls()
 
     @pytest.mark.parametrize("ancestor", [False, True])
     def test_refuse_review_dir_containing_input(self, harness, ancestor):

@@ -6,9 +6,9 @@ orchestrating third-party sub-harnesses pinned to exact `main` SHAs. The design 
 rationale are in [`PLAN.md`](./PLAN.md); agent rules are in [`AGENTS.md`](./AGENTS.md).
 
 ```text
-doc-sentinel clean  <file> [-o PATH] [--force-output] [--json] [--report PATH]
-doc-sentinel detect <file> [--sanitize [-o PATH] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
-doc-sentinel sanitize <file> --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]
+doc-sentinel clean  <file> [-o PATH | --output-dir DIR] [--force-output] [--json] [--report PATH]
+doc-sentinel detect <file> [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
+doc-sentinel sanitize <file> --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]
 doc-sentinel review-merge --review-dir DIR [--report PATH] [--agent-summary]
 doc-sentinel update [--dry-run] [--only ID] [--json]
 doc-sentinel version
@@ -34,8 +34,13 @@ If channel extraction fails (e.g. an archive part over the size limit), the verd
 
 ## Optional sanitized copy
 
-When explicitly requested, use `detect FILE --sanitize --report REPORT --agent-summary`
-to scan the original and create `<stem>.sanitized<suffix>` beside it, or specify `-o`.
+When explicitly requested, use `detect FILE --sanitize --output-dir DIR --report REPORT --agent-summary`
+to scan the original and create `<stem>.sanitized<suffix>` in `DIR`. Without `--output-dir`
+or `-o` the copy is placed beside the input; these options are mutually exclusive. The same
+`--output-dir` option is available for `clean` and `sanitize`. Use the safe summary's output
+path rather than predicting a name: a filename injection selects `sanitized-document<suffix>`
+(or `sanitized-document.docx` for PDF). An explicit output that reuses the injection-bearing
+input name is refused, and the separate report records that the original name was not reused.
 For PDF input the output is a reconstructed `<stem>.sanitized.docx`; `-o` must end in `.docx`.
 After semantic review and `review-merge`, use `sanitize FILE --review-dir DIR --report
 REPORT --agent-summary`; the original input is mounted again and its SHA-256 must match
@@ -55,9 +60,12 @@ aggregate findings require every span meeting their criterion to be verified and
 sample present among those exclusions. Other partial or ambiguous findings are refused.
 Glyph/ToUnicode divergence or unlocatable PDF hidden text is refused rather than guessed.
 Checks include opening the copy, extraction deltas, re-detection,
-and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). Tracked changes
-use the final view: deletions are removed, insertions are accepted, and rendering is compared
-against a final-view copy of the original.
+and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). DOCX rendering
+is accepted on exact pixels, or as `equivalent_with_reflow` only when rendered visible text is
+unchanged except for authorized removals, page counts match and every page scores at least 0.97
+on the visual similarity metric. The safe summary exposes the render mode, not removed text.
+Tracked changes use the final view: deletions are removed, insertions are accepted, and rendering
+is compared against a final-view copy of the original.
 
 PDF reconstruction uses visible content, not an editable copy of the original PDF:
 
@@ -132,7 +140,7 @@ The launchers build the image on first use and pass the same arguments as the CL
 ```bash
 scripts/doc-sentinel-docker.sh detect inbox/file.pdf --agent-summary --report reports/file.json
 scripts/doc-sentinel-docker.sh clean  inbox/file.docx -o reports/file.cleaned.docx
-scripts/doc-sentinel-docker.sh detect inbox/file.docx --sanitize --report reports/file.json
+scripts/doc-sentinel-docker.sh detect inbox/file.docx --sanitize --output-dir reports --report reports/file.json --agent-summary
 ```
 
 The input's folder is mounted read-only; outputs, reports and review directories are mounted

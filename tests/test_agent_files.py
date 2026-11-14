@@ -124,10 +124,10 @@ def test_agents_uses_only_the_s13_s14_command_flows():
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     contract = {
         ("detect", frozenset({"--report", "--agent-summary", "--review-dir"})),
-        ("detect", frozenset({"--sanitize", "-o", "--report", "--agent-summary"})),
-        ("sanitize", frozenset({"--review-dir", "-o", "--report", "--agent-summary"})),
+        ("detect", frozenset({"--sanitize", "--output-dir", "--report", "--agent-summary"})),
+        ("sanitize", frozenset({"--review-dir", "--output-dir", "--report", "--agent-summary"})),
         ("review-merge", frozenset({"--review-dir", "--report", "--agent-summary"})),
-        ("clean", frozenset({"-o", "--report", "--agent-summary"})),
+        ("clean", frozenset({"--output-dir", "--report", "--agent-summary"})),
         ("update", frozenset({"--json"})),
     }
     commands = [shlex.split(line.strip()) for line in text.splitlines()

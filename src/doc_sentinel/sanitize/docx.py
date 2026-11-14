@@ -336,6 +336,60 @@ def _streams(roots, entries, patches):
     return result
 
 
+def reviewed_mixed_spans(src: Path, pointer: str | None, fragment: str):
+    """Bind a reviewed body excerpt to XML atoms before excluding structural edits.
+
+    Return None if it is not an unambiguous mixed/hidden excerpt; otherwise return
+    exact visible instruction sentences within the reviewed part of the excerpt.
+    """
+    from doc_sentinel.glue.instruction_phrases import instruction_spans
+    from doc_sentinel.sanitize.pdf_to_docx import _normalized_positions
+
+    _infos, entries, _comment, _raw, _directory = read_package(src)
+    roots = _raw_roots(entries)
+    if pointer not in roots or not BODY.fullmatch(pointer):
+        return None
+    structural = _structural(roots)
+    atoms = [atom for node in roots[pointer].walk() if node.tag == W + "t"
+             for atom in _node_atoms(node)]
+    text = "".join(atom.char for atom in atoms)
+    normalized, positions = _normalized_positions(text)
+    wanted, _ = _normalized_positions(fragment)
+    start = normalized.find(wanted) if wanted else -1
+    matches = []
+    while start >= 0:
+        matches.append(atoms[positions[start]:positions[start + len(wanted) - 1] + 1])
+        start = normalized.find(wanted, start + 1)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        # A duplicate is safe only when every occurrence is entirely removed by
+        # the structural hidden-content plan; never discard a visible twin.
+        return [] if all(all(_covered(pointer, atom, structural) for atom in match)
+                         for match in matches) else None
+    selected = matches[0]
+    if not any(_covered(pointer, atom, structural) for atom in selected):
+        return None
+    selected_keys = {(atom.start, atom.end) for atom in selected}
+    spans = []
+    for stream in _streams(roots, entries, structural):
+        if stream.channel != "body" or stream.part != pointer:
+            continue
+        visible = "".join(atom.char for atom in stream.atoms)
+        reviewed = {index for index, atom in enumerate(stream.atoms)
+                    if (atom.start, atom.end) in selected_keys}
+        for left, right in instruction_spans(visible):
+            if not all(index in reviewed for index in range(left, right)):
+                continue
+            from doc_sentinel.pipeline import _sentence_bounds
+
+            begin, end = _sentence_bounds(visible, left, right)
+            span = {"channel": "body", "pointer": pointer, "text": visible[begin:end]}
+            if span not in spans:
+                spans.append(span)
+    return spans
+
+
 def _match_pointer(span, stream: Stream) -> bool:
     pointer = span.get("pointer")
     return (span.get("channel") == stream.channel and
@@ -462,8 +516,32 @@ def _actions(patches):
             for p in patches if p.record]
 
 
+_HYPHENS = frozenset("-­‐‑")
+
+
+def _render_delta_ok(original: str, candidate: str, removed: list[str]) -> bool:
+    """True when the candidate's rendered text is the original's minus removed text only.
+
+    Compared as character multisets (whitespace and hyphens ignored) so reflow, block
+    order and line-end hyphenation in the PDF text layer cannot cause a false refusal:
+    the candidate may not contain any character the original render lacks, and every
+    character missing from it must be accounted for by the removed fragments. Text that
+    LibreOffice never painted (e.g. w:vanish) is simply absent from both renders.
+    """
+    from collections import Counter
+
+    def chars(text: str) -> Counter:
+        return Counter(c for c in text if not c.isspace() and c not in _HYPHENS)
+
+    before, after = chars(original), chars(candidate)
+    if after - before:
+        return False
+    budget = chars("".join(removed))
+    return all(budget[c] >= n for c, n in (before - after).items())
+
+
 def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, *,
-                 reference: Path | None = None):
+                 reference: Path | None = None, hidden: list[str] | None = None):
     """Compare with a final-view reference containing only the visible removals.
 
     The original final view supplies affected regions. A second reference with
@@ -501,6 +579,7 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
                   pymupdf.open(pdfs[-1]) as after):
                 if len(before) != len(expected) or len(expected) != len(after):
                     return False, [], "page count changed"
+                page_count = len(before)
                 regions = []
                 for text in visible:
                     located = [(page.number, rect) for page in before for rect in page.search_for(text)]
@@ -508,6 +587,7 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
                         return False, regions, "visible injection could not be located in render"
                     regions.extend({"page": number + 1, "rect": list(rect)} for number, rect in located)
                 scale = 1.5
+                exact = True
                 for page_num, (old_page, ref_page, new_page) in enumerate(zip(before, expected, after), 1):
                     images = [page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
                                               colorspace=pymupdf.csRGB, alpha=False)
@@ -517,7 +597,7 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
                            for image in images[1:]):
                         return False, regions, "page dimensions changed"
                     if ref.samples != new.samples:
-                        return False, regions, "pixels changed outside visible injection edits"
+                        exact = False
                     if reference and old.samples != ref.samples:
                         # Reflow may affect pixels beyond the original sentence glyphs.
                         min_x, min_y, max_x, max_y = old.width, old.height, -1, -1
@@ -531,7 +611,22 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
                         if max_x >= 0:
                             regions.append({"page": page_num, "rect": [min_x / scale, min_y / scale,
                                             (max_x + 1) / scale, (max_y + 1) / scale]})
-            return True, regions, "all pages compared at 108 DPI against final view"
+            if exact:
+                return True, regions, "all pages compared at 108 DPI against final view", "exact", [1.0] * page_count
+            from doc_sentinel.sanitize import _normalized
+            from doc_sentinel.sanitize.pdf_to_docx import _similarity
+
+            with pymupdf.open(pdfs[-2]) as expected, pymupdf.open(pdfs[-1]) as after:
+                expected_text = _normalized(" ".join(page.get_text() for page in expected))
+                actual_text = _normalized(" ".join(page.get_text() for page in after))
+            if not _render_delta_ok(expected_text, actual_text, list(hidden or [])):
+                return False, regions, "rendered visible text changed"
+            metric = _similarity(pdfs[-2], pdfs[-1])
+            scores = [item["similarity"] for item in metric["pages"]]
+            if (metric["source_pages"] != metric["output_pages"] or len(scores) != metric["source_pages"] or
+                    not scores or any(not math.isfinite(score) or score < 0.97 for score in scores)):
+                return False, regions, "rendered visual similarity below 0.97"
+            return True, regions, "visible text and page count preserved with reflow", "equivalent_with_reflow", scores
     except (OSError, ImportError, ValueError, AdapterError):
         return False, [], "LibreOffice rendering or offline isolation failed"
 
@@ -594,8 +689,11 @@ def sanitize_docx(src: Path, spans: list[dict], workdir: Path) -> Outcome:
             reference.write_bytes(write_package(infos, _apply(entries, reference_patches),
                                                 {p.part for p in reference_patches},
                                                 comment, raw, start_dir))
-        equal, regions, reason = render_equal(final_view, candidate, visible, workdir, reference=reference)
-    checks["render_equal"] = _check("passed" if equal else "failed", reason, regions=regions)
+        comparison = render_equal(final_view, candidate, visible, workdir, reference=reference,
+                                  hidden=[p.text for p in patches if p.visibility == "hidden"])
+        equal, regions, reason = comparison[:3]
+    details = ({"mode": comparison[3], "similarity": comparison[4]} if len(comparison) == 5 else {})
+    checks["render_equal"] = _check("passed" if equal else "failed", reason, regions=regions, **details)
     if not equal:
         return Outcome("refused", actions=actions, checks=checks, reason=reason)
     return Outcome("sanitized", data, actions, checks)

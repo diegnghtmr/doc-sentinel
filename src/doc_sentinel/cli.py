@@ -8,8 +8,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import ntpath
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from doc_sentinel import __version__
@@ -21,6 +23,7 @@ from doc_sentinel.pipeline import (
     UsageError,
     default_output,
     default_sanitized_output,
+    has_filename_injection,
     pin_sanitized_output,
     run_clean,
     run_detect,
@@ -45,8 +48,11 @@ def _parser() -> argparse.ArgumentParser:
 
     clean = sub.add_parser("clean", help="write a cleaned copy (never modifies the input)")
     clean.add_argument("file", type=Path)
-    clean.add_argument("-o", "--output", type=Path,
-                       help="destination (default: <stem>.cleaned<suffix> next to the input)")
+    clean_destination = clean.add_mutually_exclusive_group()
+    clean_destination.add_argument("-o", "--output", type=Path,
+                                   help="destination (default: <stem>.cleaned<suffix> next to the input)")
+    clean_destination.add_argument("--output-dir", type=Path,
+                                   help="directory for the automatically named cleaned copy")
     clean.add_argument("--force-output", action="store_true",
                        help="replace an existing output file (never the input)")
     clean_format = clean.add_mutually_exclusive_group()
@@ -64,8 +70,11 @@ def _parser() -> argparse.ArgumentParser:
                                help="print only the orchestrator-safe JSON summary on stdout")
     detect.add_argument("--sanitize", action="store_true",
                         help="optionally write a separately verified sanitized copy")
-    detect.add_argument("-o", "--output", type=Path,
-                        help="sanitized destination (requires --sanitize; PDF output must be .docx)")
+    detect_destination = detect.add_mutually_exclusive_group()
+    detect_destination.add_argument("-o", "--output", type=Path,
+                                    help="sanitized destination (requires --sanitize; PDF output must be .docx)")
+    detect_destination.add_argument("--output-dir", type=Path,
+                                    help="directory for the automatically named copy (requires --sanitize)")
     detect.add_argument("--force-output", action="store_true",
                         help="replace an existing sanitized output after verification")
     detect.add_argument("--review-dir", type=Path,
@@ -83,8 +92,11 @@ def _parser() -> argparse.ArgumentParser:
     sanitized = sub.add_parser("sanitize", help="write a checked copy after semantic review")
     sanitized.add_argument("file", type=Path, help="original input, verified against the review plan")
     sanitized.add_argument("--review-dir", required=True, type=Path, help="review plan and answers")
-    sanitized.add_argument("-o", "--output", type=Path,
-                           help="destination (default: <stem>.sanitized<suffix>; PDF: .sanitized.docx)")
+    sanitized_destination = sanitized.add_mutually_exclusive_group()
+    sanitized_destination.add_argument("-o", "--output", type=Path,
+                                       help="destination (default: <stem>.sanitized<suffix>; PDF: .sanitized.docx)")
+    sanitized_destination.add_argument("--output-dir", type=Path,
+                                       help="directory for the automatically named sanitized copy")
     sanitized.add_argument("--force-output", action="store_true",
                            help="replace an existing output only after verification")
     sanitized.add_argument("--report", type=Path, help="write the report to PATH")
@@ -110,21 +122,44 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _pin_report(args: argparse.Namespace) -> PinnedTarget | None:
+def _pin_report(args: argparse.Namespace, output: Path | None = None) -> PinnedTarget | None:
     """Validate --report before any untrusted work runs (see report.PinnedTarget)."""
     if not args.report:
         return None
     protect = [args.file]
     writing_output = args.command in {"clean", "sanitize"} or getattr(args, "sanitize", False)
-    if args.command == "clean":
+    if output is not None:
+        protect.append(output)
+    elif args.command == "clean":
         protect.append(args.output or default_output(args.file))
-    elif writing_output:
-        protect.append(args.output or default_sanitized_output(args.file))
     what = ("the input and the output document" if writing_output else "the input document")
     for item in protect:
         if same_file(args.report, item):
             raise UsageError(f"report path must differ from {what}")
     return pin_target(args.report, protect=protect)
+
+
+def _protect_report_output(target: PinnedTarget | None, src: Path, dest: Path):
+    if target is None:
+        return None
+    if same_file(target.path, dest):
+        raise UsageError("report path must differ from the input and the output document")
+    extra = pin_target(target.path, protect=[src, dest])
+    if extra.parent != target.parent or extra.parent_id != target.parent_id:
+        raise UnsafePathError("report directory changed after validation")
+    return replace(target, protected=target.protected | extra.protected,
+                   protected_entries=target.protected_entries | extra.protected_entries)
+
+
+def _chosen_output(args, report):
+    if args.output is not None:
+        return args.output
+    default = default_sanitized_output(args.file)
+    name = default.name
+    if has_filename_injection(report):
+        name = "sanitized-document" + default.suffix
+        report["warnings"].append("original filename was not reused because it was marked as an injection")
+    return (args.output_dir or args.file.parent) / name
 
 
 def _emit(report: dict, args: argparse.Namespace, report_target: PinnedTarget | None,
@@ -136,12 +171,18 @@ def _emit(report: dict, args: argparse.Namespace, report_target: PinnedTarget | 
         if input_path and input_path.startswith("/work/in/"):
             input_path = os.environ.get("DOC_SENTINEL_HOST_INPUT", input_path)
         output_path = None
-        if args.command == "clean" and report.get("output_path"):
-            output_path = str(args.output or default_output(args.file))
-        elif report.get("sanitize", {}).get("status") == "sanitized":
-            output_path = str(args.output or default_sanitized_output(args.file))
+        if ((args.command == "clean" and report.get("output_path")) or
+                report.get("sanitize", {}).get("status") == "sanitized"):
+            selected = getattr(args, "_output_path", None)
+            output_path = str(selected or args.output or default_output(args.file))
         if output_path and output_path.startswith("/work/out/"):
-            output_path = os.environ.get("DOC_SENTINEL_HOST_OUTPUT", output_path)
+            host_output = os.environ.get("DOC_SENTINEL_HOST_OUTPUT")
+            host_dir = os.environ.get("DOC_SENTINEL_HOST_OUTPUT_DIR")
+            if host_output:
+                output_path = host_output
+            elif host_dir:
+                join = ntpath.join if ntpath.splitdrive(host_dir)[0] or "\\" in host_dir else os.path.join
+                output_path = join(host_dir, output_path.removeprefix("/work/out/"))
         report_path = str(args.report) if args.report else None
         if report_path and report_path.startswith(("/work/report/", "/work/out/")):
             report_path = os.environ.get("DOC_SENTINEL_HOST_REPORT", report_path)
@@ -201,13 +242,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "detect":
             if not args.file.is_file():
                 raise UsageError(f"input not found: {args.file}")
-            if not args.sanitize and (args.output is not None or args.force_output):
-                raise UsageError("--output and --force-output require --sanitize")
+            if not args.sanitize and (args.output is not None or args.output_dir is not None or args.force_output):
+                raise UsageError("--output, --output-dir and --force-output require --sanitize"
+                                 if args.output_dir is not None else
+                                 "--output and --force-output require --sanitize")
             dest = output_target = None
-            if args.sanitize:
+            if args.sanitize and args.output is not None:
                 dest, output_target = pin_sanitized_output(args.file, args.output, args.force_output,
                                                             args.report)
-            report_target = _pin_report(args)
+            report_target = _pin_report(args, dest)
             targets = None
             if args.review_dir:
                 from doc_sentinel.review import prepare_review
@@ -224,22 +267,38 @@ def main(argv: list[str] | None = None) -> int:
                 options["review_targets"] = targets
             report, code = run_detect(args.file, **options)
             if args.sanitize:
+                selected = _chosen_output(args, report)
+                if dest is None:
+                    dest, output_target = pin_sanitized_output(args.file, selected, args.force_output, args.report)
+                    report_target = _protect_report_output(report_target, args.file, dest)
+                    if targets and (dest == targets.root or targets.root in dest.parents):
+                        raise UsageError("output path must be outside the review directory")
+                args._output_path = selected
                 report, code = run_sanitize(args.file, dest, output_target, report, code)
             _emit(report, args, report_target, code, targets.summary if targets else None)
             return code
         if args.command == "sanitize":
             from doc_sentinel.review import load_plan, merge, public_review
 
-            dest, output_target = pin_sanitized_output(args.file, args.output, args.force_output,
-                                                        args.report)
-            report_target = _pin_report(args)
+            dest = output_target = None
+            if args.output is not None:
+                dest, output_target = pin_sanitized_output(args.file, args.output, args.force_output,
+                                                            args.report)
+            report_target = _pin_report(args, dest)
             root = args.review_dir.resolve()
-            if dest == root or root in dest.parents:
+            if dest is not None and (dest == root or root in dest.parents):
                 raise UsageError("output path must be outside the review directory")
             if args.report and (args.report.resolve() == root or root in args.report.resolve().parents):
                 raise UsageError("report path must be outside the review directory")
             plan, original = load_plan(root)
             report, code = merge(root, plan, original, include_sanitize_provenance=True)
+            selected = _chosen_output(args, report)
+            if dest is None:
+                dest, output_target = pin_sanitized_output(args.file, selected, args.force_output, args.report)
+                report_target = _protect_report_output(report_target, args.file, dest)
+                if dest == root or root in dest.parents:
+                    raise UsageError("output path must be outside the review directory")
+            args._output_path = selected
             report, code = run_sanitize(args.file, dest, output_target, report, code,
                                         plan=plan, review_root=root)
             _emit(report, args, report_target, code, public_review(root, plan))
@@ -247,8 +306,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "clean":
             if not args.file.is_file():
                 raise UsageError(f"input not found: {args.file}")
-            report_target = _pin_report(args)
-            report, code = run_clean(args.file, output=args.output,
+            selected = args.output or ((args.output_dir / default_output(args.file).name)
+                                       if args.output_dir is not None else default_output(args.file))
+            args._output_path = selected
+            report_target = _pin_report(args, selected)
+            report, code = run_clean(args.file, output=selected,
                                      force_output=args.force_output, report_path=args.report)
             _emit(report, args, report_target, code)
             return code
