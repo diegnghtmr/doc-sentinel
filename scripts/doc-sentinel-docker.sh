@@ -3,10 +3,11 @@
 
 usage() {
     printf '%s\n' \
-        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,review-merge,version,intent} ...' \
+        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,sanitize,review-merge,version,intent} ...' \
         '  clean FILE [-o PATH] [--force-output] [--json|--agent-summary] [--report PATH]' \
-        '  detect FILE [--json|--agent-summary] [--report PATH] [--review-dir DIR]' \
-        '  review-merge --review-dir DIR [--report PATH] [--agent-summary]' \
+        '  detect FILE [--sanitize [-o PATH] [--force-output]] [--agent-summary] [--review-dir DIR]' \
+        '  sanitize FILE --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]' \
+        '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'  \
         '  version | intent TEXT...' \
         '  update and --allow-network require the Python CLI on the host.'
 }
@@ -31,12 +32,13 @@ if [ "${1-}" = '--rebuild' ]; then rebuild=1; shift; fi
 case "$1" in
     --help|-h) usage; exit 0 ;;
     update) fail 'update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)' ;;
-    clean|detect|review-merge|version|intent) mode=$1; shift ;;
+    clean|detect|sanitize|review-merge|version|intent) mode=$1; shift ;;
     *) fail "unknown command: $1" ;;
 esac
 
-input=''; output=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''
-if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
+input=''; output=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''; sanitized=0
+[ "$mode" != sanitize ] || sanitized=1
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
@@ -45,21 +47,22 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; th
                 option=$1; shift
                 [ "$#" -gt 0 ] && [ -n "$1" ] || fail "missing value for $option"
                 case "$option" in
-                    -o|--output) [ "$mode" = clean ] || fail "unknown option: $option"; output=$1 ;;
+                    -o|--output) [ "$mode" != review-merge ] || fail "unknown option: $option"; output=$1 ;;
                     --report) report=$1 ;;
                     --review-dir) [ "$mode" != clean ] || fail "unknown option: $option"; review=$1 ;;
                     --fail-on) [ "$mode" = detect ] || fail "unknown option: $option"; fail_on=$1 ;;
                 esac ;;
             --output=*|-o?*)
-                [ "$mode" = clean ] || fail "unknown option: $1"
+                [ "$mode" != review-merge ] || fail "unknown option: $1"
                 case "$1" in --output=*) output=${1#--output=} ;; *) output=${1#-o} ;; esac
                 [ -n "$output" ] || fail 'missing value for --output' ;;
             --report=*) report=${1#--report=}; [ -n "$report" ] || fail 'missing value for --report' ;;
             --review-dir=*) [ "$mode" != clean ] || fail "unknown option: $1"; review=${1#--review-dir=}; [ -n "$review" ] || fail 'missing value for --review-dir' ;;
             --fail-on=*) [ "$mode" = detect ] || fail "unknown option: $1"; fail_on=${1#--fail-on=}; [ -n "$fail_on" ] || fail 'missing value for --fail-on' ;;
-            --json) [ "$mode" != review-merge ] || fail "unknown option: $1"; json=1 ;;
+            --json) [ "$mode" = clean ] || [ "$mode" = detect ] || fail "unknown option: $1"; json=1 ;;
             --agent-summary) agent=1 ;;
-            --force-output) [ "$mode" = clean ] || fail "unknown option: $1"; force=1 ;;
+            --sanitize) [ "$mode" = detect ] || fail "unknown option: $1"; sanitized=1 ;;
+            --force-output) [ "$mode" != review-merge ] || fail "unknown option: $1"; force=1 ;;
             --prompt-guard) [ "$mode" = detect ] || fail "unknown option: $1"; prompt_guard=1 ;;
             --)
                 shift
@@ -71,6 +74,10 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; th
         shift
     done
     [ "$json" -eq 0 ] || [ "$agent" -eq 0 ] || fail '--json and --agent-summary are mutually exclusive'
+    if [ "$mode" = detect ] && [ "$sanitized" -eq 0 ] && { [ -n "$output" ] || [ "$force" -eq 1 ]; }; then
+        fail '--output and --force-output require --sanitize'
+    fi
+    if [ "$mode" = sanitize ] && [ -z "$review" ]; then fail 'sanitize requires --review-dir'; fi
     case "$fail_on" in ''|high|medium) ;; *) fail 'invalid --fail-on value (choose high or medium)' ;; esac
     if [ "$mode" != review-merge ]; then
         [ -n "$input" ] || fail 'expected an input file'
@@ -96,11 +103,13 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; th
             [ -d "$review" ] || fail 'review directory does not exist'
         fi
     fi
-    if [ "$mode" = clean ]; then
+    if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
+        suffix=cleaned
+        [ "$sanitized" -eq 0 ] || suffix=sanitized
         if [ -z "$output" ]; then
             case "$in_name" in
-                .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.cleaned" ;; *) out_name="${in_name%.*}.cleaned.${in_name##*.}" ;; esac ;;
-                *) out_name="$in_name.cleaned" ;;
+                .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.$suffix" ;; *) out_name="${in_name%.*}.$suffix.${in_name##*.}" ;; esac ;;
+                *) out_name="$in_name.$suffix" ;;
             esac
             output=$in_dir/$out_name
         fi
@@ -110,7 +119,7 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; th
     fi
     if [ -n "$report" ]; then
         report=$(resolve_path "$report") || fail 'report directory does not exist'
-        if [ "$mode" = clean ]; then
+        if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
             if same_path "$report" "$input" || same_path "$report" "$output"; then
                 fail 'report path must differ from the input and the output document'
             fi
@@ -150,16 +159,16 @@ if [ "$rebuild" -eq 1 ] || ! docker image inspect doc-sentinel:local >/dev/null 
 fi
 
 # Save intent/version arguments as positional parameters, then prepend Docker arguments.
-if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     if [ "$mode" = review-merge ]; then set -- "$mode"; else set -- "$mode" "/work/in/$in_name"; fi
-    if [ "$mode" = clean ]; then
+    if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
         set -- "$@" -o "/work/out/$out_name"
         [ "$force" -eq 0 ] || set -- "$@" --force-output
     fi
     [ "$json" -eq 0 ] || set -- "$@" --json
     [ "$agent" -eq 0 ] || set -- "$@" --agent-summary
     if [ -n "$report" ]; then
-        if [ "$mode" = clean ] && [ "$report_dir" = "$out_dir" ]; then
+        if { [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; } && [ "$report_dir" = "$out_dir" ]; then
             container_report=/work/out/$report_name
         else
             container_report=/work/report/$report_name
@@ -169,16 +178,17 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; th
     [ -z "$fail_on" ] || set -- "$@" --fail-on "$fail_on"
     [ "$prompt_guard" -eq 0 ] || set -- "$@" --prompt-guard
     [ -z "$review" ] || set -- "$@" --review-dir /work/review
+    if [ "$mode" = detect ] && [ "$sanitized" -eq 1 ]; then set -- "$@" --sanitize; fi
 else
     set -- "$mode" "$@"
 fi
 set -- doc-sentinel:local "$@"
-if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     [ -z "$review" ] || set -- -v "$review:/work/review:rw" "$@"
-    if [ -n "$report" ] && { [ "$mode" != clean ] || [ "$report_dir" != "$out_dir" ]; }; then
+    if [ -n "$report" ] && { { [ "$mode" != clean ] && [ "$sanitized" -eq 0 ]; } || [ "$report_dir" != "$out_dir" ]; }; then
         set -- -v "$report_dir:/work/report:rw" "$@"
     fi
-    if [ "$mode" = clean ]; then set -- -v "$out_dir:/work/out:rw" "$@"; fi
+    if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then set -- -v "$out_dir:/work/out:rw" "$@"; fi
     if [ "$mode" != review-merge ]; then set -- -v "$in_dir:/work/in:ro" "$@"; fi
     if [ "$agent" -eq 1 ]; then
         [ -z "$review" ] || set -- -e "DOC_SENTINEL_HOST_REVIEW=$review" "$@"

@@ -90,6 +90,18 @@ def to_markdown(report: dict[str, Any]) -> str:
         for action in report["clean_actions"]:
             details = ", ".join(f"{k}={v}" for k, v in action.items() if k != "adapter")
             lines.append(f"- `{action['adapter']}`: {details}")
+    if report.get("sanitize"):
+        section = report["sanitize"]
+        lines += ["", "## Sanitize", "", f"- Status: `{section['status']}`"]
+        if section.get("output_path"):
+            lines.append(f"- Output: `{section['output_path']}`")
+        if section.get("refusal_reason"):
+            lines.append("- Refusal reason: " + section["refusal_reason"])
+        for action in section.get("actions", []):
+            lines += ["", (f"- {action['technique']} ({action['visibility']}); "
+                           f"part={action['part']}; location={action['location']}; "
+                           f"bytes removed={action['bytes_removed']}; reason={action['reason']}")]
+            lines.append(_fence(action.get("removed_text", "")))
     lines += ["", f"## Findings ({len(report['findings'])})", ""]
     if not report["findings"]:
         lines.append("No findings.")

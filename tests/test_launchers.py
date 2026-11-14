@@ -186,6 +186,32 @@ class LauncherScenarios:
         assert args == ["review-merge", "--agent-summary", "--report", "/work/report/merged.json",
                         "--review-dir", "/work/review"]
 
+    @pytest.mark.parametrize("mode", ["detect", "sanitize"])
+    def test_sanitize_maps_original_read_only_and_output_review_mounts(self, harness, mode):
+        review = harness.report_dir / "review dir"
+        review.mkdir()
+        output = harness.output_dir / "safe copy.docx"
+        report = harness.report_dir / "audit.json"
+        args = [mode, harness.input, "--review-dir", review, "-o", output,
+                "--force-output", "--report", report, "--agent-summary"]
+        if mode == "detect":
+            args.append("--sanitize")
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_INPUT={harness.path(harness.input)}" in recorded
+        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(output)}" in recorded
+        forwarded = harness.assert_base(recorded, [
+            (harness.input_dir, "/work/in", "ro"), (harness.output_dir, "/work/out", "rw"),
+            (harness.report_dir, "/work/report", "rw"), (review, "/work/review", "rw")])
+        expected = [mode, "/work/in/informe final.docx", "-o", "/work/out/safe copy.docx",
+                    "--force-output", "--agent-summary", "--report", "/work/report/audit.json",
+                    "--review-dir", "/work/review"]
+        if mode == "detect":
+            expected.append("--sanitize")
+        assert forwarded == expected
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
     def test_clean_agent_summary_is_forwarded(self, harness):
         result = harness.run("clean", harness.input, "--agent-summary")
         assert result.returncode == 0

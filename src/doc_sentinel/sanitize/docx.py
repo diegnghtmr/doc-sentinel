@@ -46,6 +46,10 @@ class Patch:
     technique: str
     visibility: str
     reason: str
+    on_page: bool = False
+    record: bool = True
+    action_end: int | None = None
+    extra_bytes: int = 0
 
 
 @dataclass
@@ -237,7 +241,19 @@ def _structural(roots):
             if node.tag == W + "del" and node.ancestor(W + "del") is None:
                 atoms = [a for child in node.walk() for a in _node_atoms(child)]
                 patches.append(Patch(name, node.start, node.end, "".join(a.char for a in atoms),
-                                     "tracked-deletion", "hidden", "deleted in the final view"))
+                                     "tracked_deletion", "hidden", "deleted in the final view"))
+            elif node.tag == W + "ins" and node.ancestor(W + "del") is None:
+                # Remove only the wrapper, never the inserted runs. Keep these two
+                # byte edits distinct so nested hidden/visible edits cannot overlap.
+                tail = node.end - node.closing_start
+                patches.append(Patch(name, node.start, node.opening_end, "",
+                                     "tracked_insertion_accepted", "visible",
+                                     "insertion accepted in the final view",
+                                     action_end=node.end, extra_bytes=tail))
+                if tail:
+                    patches.append(Patch(name, node.closing_start, node.end, "",
+                                         "tracked_insertion_accepted", "visible",
+                                         "insertion accepted in the final view", record=False))
             elif node.tag == W + "r" and node.ancestor(W + "del") is None:
                 reason = _hidden(node, defaults, styles, default_para, background)
                 if reason:
@@ -327,7 +343,7 @@ def _match_pointer(span, stream: Stream) -> bool:
              (stream.channel == "body" and pointer == "body")))
 
 
-def _atom_patches(part, atoms, technique, visibility, reason):
+def _atom_patches(part, atoms, technique, visibility, reason, *, on_page=False):
     if not atoms:
         return []
     patches = []
@@ -337,10 +353,12 @@ def _atom_patches(part, atoms, technique, visibility, reason):
             group.append(atom)
         else:
             patches.append(Patch(part, group[0].start, group[-1].end,
-                                 "".join(a.char for a in group), technique, visibility, reason))
+                                 "".join(a.char for a in group), technique, visibility, reason,
+                                 on_page=on_page))
             group = [atom]
     patches.append(Patch(part, group[0].start, group[-1].end,
-                         "".join(a.char for a in group), technique, visibility, reason))
+                         "".join(a.char for a in group), technique, visibility, reason,
+                         on_page=on_page))
     return patches
 
 
@@ -370,7 +388,8 @@ def _plan(roots, entries, spans):
         if any(_covered(stream.part, atom, patches) for atom in selected):
             raise ValueError("DOCX injection spans overlap")
         patches.extend(_atom_patches(stream.part, selected, "visible-injection", "visible",
-                                     "caller supplied an exact injection fragment"))
+                                     "caller supplied an exact injection fragment",
+                                     on_page=stream.on_page))
         if stream.on_page:
             visible_texts.append(text)
     # Apply the shared Unicode rules to paragraph text, retaining context across runs.
@@ -437,13 +456,20 @@ def _delta_ok(original, changed, patches):
 
 def _actions(patches):
     return [{"format": "docx", "part": p.part,
-             "location": {"start_byte": p.start, "end_byte": p.end},
+             "location": {"start_byte": p.start, "end_byte": p.action_end or p.end},
              "technique": p.technique, "visibility": p.visibility, "reason": p.reason,
-             "removed_text": p.text, "bytes_removed": p.end - p.start} for p in patches]
+             "removed_text": p.text, "bytes_removed": p.end - p.start + p.extra_bytes}
+            for p in patches if p.record]
 
 
-def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path):
-    """Compare all rendered pages; differences are permitted only in located body spans."""
+def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, *,
+                 reference: Path | None = None):
+    """Compare with a final-view reference containing only the visible removals.
+
+    The original final view supplies affected regions. A second reference with
+    precisely the authorized visible edits accounts for natural text reflow;
+    every pixel of that reference must equal the delivered candidate.
+    """
     executable = shutil.which("soffice")
     if executable is None:
         return False, [], "LibreOffice is unavailable"
@@ -453,7 +479,8 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path):
         with tempfile.TemporaryDirectory(prefix="doc-sentinel-render-", dir=workdir) as scratch:
             root = Path(scratch)
             pdfs = []
-            for index, path in enumerate((src, candidate)):
+            paths = (src, reference, candidate) if reference else (src, candidate)
+            for index, path in enumerate(paths):
                 directory = root / str(index)
                 directory.mkdir()
                 source = directory / "document.docx"
@@ -468,8 +495,10 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path):
                 if not pdf.is_file():
                     return False, [], "LibreOffice did not produce a PDF"
                 pdfs.append(pdf)
-            with pymupdf.open(pdfs[0]) as before, pymupdf.open(pdfs[1]) as after:
-                if len(before) != len(after):
+            with (pymupdf.open(pdfs[0]) as before,
+                  pymupdf.open(pdfs[-2]) as expected,
+                  pymupdf.open(pdfs[-1]) as after):
+                if len(before) != len(expected) or len(expected) != len(after):
                     return False, [], "page count changed"
                 regions = []
                 for text in visible:
@@ -478,26 +507,30 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path):
                         return False, regions, "visible injection could not be located in render"
                     regions.extend({"page": number + 1, "rect": list(rect)} for number, rect in located)
                 scale = 1.5
-                for page_num, (old_page, new_page) in enumerate(zip(before, after), 1):
-                    old = old_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), colorspace=pymupdf.csRGB,
-                                              alpha=False)
-                    new = new_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), colorspace=pymupdf.csRGB,
-                                              alpha=False)
-                    if (old.width, old.height, old.n) != (new.width, new.height, new.n):
+                for page_num, (old_page, ref_page, new_page) in enumerate(zip(before, expected, after), 1):
+                    images = [page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
+                                              colorspace=pymupdf.csRGB, alpha=False)
+                              for page in (old_page, ref_page, new_page)]
+                    old, ref, new = images
+                    if any((image.width, image.height, image.n) != (old.width, old.height, old.n)
+                           for image in images[1:]):
                         return False, regions, "page dimensions changed"
-                    old_samples, new_samples = old.samples, new.samples
-                    if old_samples == new_samples:
-                        continue
-                    boxes = [r["rect"] for r in regions if r["page"] == page_num]
-                    for index in range(old.width * old.height):
-                        pos = index * old.n
-                        if old_samples[pos:pos + old.n] == new_samples[pos:pos + old.n]:
-                            continue
-                        x, y = index % old.width / scale, index // old.width / scale
-                        if not any(x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1
-                                   for x0, y0, x1, y1 in boxes):
-                            return False, regions, "pixels changed outside visible injection regions"
-            return True, regions, "all pages compared at 108 DPI"
+                    if ref.samples != new.samples:
+                        return False, regions, "pixels changed outside visible injection edits"
+                    if reference and old.samples != ref.samples:
+                        # Reflow may affect pixels beyond the original sentence glyphs.
+                        min_x, min_y, max_x, max_y = old.width, old.height, -1, -1
+                        old_samples, ref_samples = old.samples, ref.samples
+                        for index in range(old.width * old.height):
+                            pos = index * old.n
+                            if old_samples[pos:pos + old.n] != ref_samples[pos:pos + old.n]:
+                                x, y = index % old.width, index // old.width
+                                min_x, min_y = min(min_x, x), min(min_y, y)
+                                max_x, max_y = max(max_x, x), max(max_y, y)
+                        if max_x >= 0:
+                            regions.append({"page": page_num, "rect": [min_x / scale, min_y / scale,
+                                            (max_x + 1) / scale, (max_y + 1) / scale]})
+            return True, regions, "all pages compared at 108 DPI against final view"
     except (OSError, ImportError, ValueError, AdapterError):
         return False, [], "LibreOffice rendering or offline isolation failed"
 
@@ -541,9 +574,26 @@ def sanitize_docx(src: Path, spans: list[dict], workdir: Path) -> Outcome:
         checks["render_equal"] = _check("skipped", "earlier self-check failed")
         return Outcome("refused", actions=actions, checks=checks, reason="DOCX text self-check failed")
     with tempfile.TemporaryDirectory(prefix="doc-sentinel-candidate-", dir=workdir) as scratch:
-        candidate = Path(scratch) / "candidate.docx"
+        root = Path(scratch)
+        candidate = root / "candidate.docx"
         candidate.write_bytes(data)
-        equal, regions, reason = render_equal(src, candidate, visible, workdir)
+        final_patches = [p for p in patches if p.technique in {
+            "tracked_deletion", "tracked_insertion_accepted"}]
+        final_view = src
+        if final_patches:
+            final_view = root / "final-view.docx"
+            final_view.write_bytes(write_package(infos, _apply(entries, final_patches),
+                                                 {p.part for p in final_patches}, comment, raw, start_dir))
+        reference = None
+        if visible:
+            # Start from the original bytes and apply only final-view changes and
+            # explicitly authorized on-page injections, not hidden-content edits.
+            reference_patches = [p for p in patches if p in final_patches or p.on_page]
+            reference = root / "visible-edits.docx"
+            reference.write_bytes(write_package(infos, _apply(entries, reference_patches),
+                                                {p.part for p in reference_patches},
+                                                comment, raw, start_dir))
+        equal, regions, reason = render_equal(final_view, candidate, visible, workdir, reference=reference)
     checks["render_equal"] = _check("passed" if equal else "failed", reason, regions=regions)
     if not equal:
         return Outcome("refused", actions=actions, checks=checks, reason=reason)

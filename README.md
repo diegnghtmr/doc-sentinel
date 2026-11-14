@@ -7,7 +7,9 @@ rationale are in [`PLAN.md`](./PLAN.md); agent rules are in [`AGENTS.md`](./AGEN
 
 ```text
 doc-sentinel clean  <file> [-o PATH] [--force-output] [--json] [--report PATH]
-doc-sentinel detect <file> [--json] [--report PATH] [--allow-network] [--fail-on high|medium] [--prompt-guard]
+doc-sentinel detect <file> [--sanitize [-o PATH] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
+doc-sentinel sanitize <file> --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]
+doc-sentinel review-merge --review-dir DIR [--report PATH] [--agent-summary]
 doc-sentinel update [--dry-run] [--only ID] [--json]
 doc-sentinel version
 doc-sentinel intent "<natural-language request>"   # -> clean | detect | update | detect+clean
@@ -29,6 +31,29 @@ an empty network namespace (`unshare -rn`). If that namespace cannot be created,
 That declaration is verified: it is honored only when the process sees no network interface
 other than loopback; otherwise `unshare -rn` is used, or the step fails closed.
 If channel extraction fails (e.g. an archive part over the size limit), the verdict is `error`.
+
+## Optional sanitized copy
+
+When explicitly requested, use `detect FILE --sanitize --report REPORT --agent-summary`
+to scan the original and create `<stem>.sanitized<suffix>` beside it, or specify `-o`.
+After semantic review and `review-merge`, use `sanitize FILE --review-dir DIR --report
+REPORT --agent-summary`; the original input is mounted again and its SHA-256 must match
+the review plan. The detect verdict remains the original document's verdict. A refused
+or unsupported copy exits 2; `sanitized` and `nothing_to_do` retain the detect exit
+(0 or 1), and `nothing_to_do` creates no copy. Existing outputs require `--force-output`;
+an existing target is only atomically replaced when all checks pass, and is preserved
+on refusal.
+
+The separate report records each action and its location, technique, visibility, reason and
+removed text. The agent summary includes only status, output path, a safe refusal reason,
+and counts by technique and visibility, never removed text. Visible instructions are removed
+by sentence; hidden content is removed by run or element. DOCX, HTML, TXT and MD are supported
+within conservative exact-span limits. PDF will be sanitized as a faithful DOCX reconstruction
+(S15, in progress); PDF sanitization is not yet available. Glyph/ToUnicode divergence is
+refused rather than guessed. Checks include opening the copy, extraction deltas, re-detection,
+and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). Tracked changes
+use the final view: deletions are removed, insertions are accepted, and rendering is compared
+against a final-view copy of the original.
 
 ## Sub-harnesses
 

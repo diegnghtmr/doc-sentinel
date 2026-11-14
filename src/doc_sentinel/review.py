@@ -292,6 +292,41 @@ def load_plan(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             os.close(root_fd)
 
 
+def review_fragments(root: Path, plan: dict) -> dict[str, str]:
+    """Return validated datamarked task fragments for source-location verification.
+
+    Call only after load_plan has validated the plan and its batch hashes. Never expose
+    these fragments to an orchestrator or use them as removal spans.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = batch_fd = None
+    try:
+        root_fd = os.open(root, flags)
+        if not plan["batches"]:
+            return {}
+        batch_fd = os.open("batches", flags, dir_fd=root_fd)
+        batches = []
+        fragments = {}
+        for entry in plan["batches"]:
+            batch = _parse(_read_bounded(f"{entry['batch_id']}.json", 1024 * 1024,
+                                         dir_fd=batch_fd))
+            if batch["plan_id"] != plan["plan_id"] or batch["batch_id"] != entry["batch_id"]:
+                raise ValueError("batch changed")
+            batches.append({key: batch[key] for key in ("batch_id", "notice", "fragments")})
+            for item in batch["fragments"]:
+                fragments[item["task_id"]] = item["text"]
+        if _hash(plan["input_sha256"], batches) != plan["plan_id"]:
+            raise ValueError("batch changed")
+        return fragments
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, UnicodeError) as exc:
+        raise ReviewError("invalid or unreadable review plan/report") from exc
+    finally:
+        if batch_fd is not None:
+            os.close(batch_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
 def _validate_answer(data: bytes, plan: dict, entry: dict) -> list[dict]:
     answer = _parse(data)
     if (not isinstance(answer, dict) or set(answer) != {"plan_id", "batch_id", "results"} or
@@ -324,9 +359,10 @@ def _finding(item: dict) -> Finding:
                    remediation=item["remediation"], finding_id=item["finding_id"])
 
 
-def merge(root: Path, plan: dict, original: dict) -> tuple[dict, int]:
+def merge(root: Path, plan: dict, original: dict, *,
+          include_sanitize_provenance: bool = False) -> tuple[dict, int]:
     report = copy.deepcopy(original)
-    errors, semantic = [], []
+    errors, semantic, sanitize_origins = [], [], []
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     answers_fd = None
     directory_status = None
@@ -370,6 +406,8 @@ def merge(root: Path, plan: dict, original: dict) -> tuple[dict, int]:
                 if label == "benign" or (label == "injection" and score < 0.5):
                     continue
                 for origin in origins[answer["task_id"]]:
+                    if label == "injection":
+                        sanitize_origins.append({"task_id": answer["task_id"], "origin": origin})
                     hidden = origin["hidden"] or origin["channel"] != "body"
                     severity = ("info" if label == "unsure" else
                                 "critical" if hidden and score >= 0.9 else
@@ -390,6 +428,8 @@ def merge(root: Path, plan: dict, original: dict) -> tuple[dict, int]:
         if answers_fd is not None:
             os.close(answers_fd)
     report["review_errors"] = errors
+    if include_sanitize_provenance:
+        report["_sanitize_review_origins"] = sanitize_origins
     code = plan["deterministic_exit"]
     if semantic:
         base = [_finding(item) for item in report["findings"]]

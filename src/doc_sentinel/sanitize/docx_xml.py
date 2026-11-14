@@ -21,6 +21,8 @@ class Node:
     attrs: dict[str, str]
     start: int
     end: int = 0
+    opening_end: int = 0
+    closing_start: int = 0
     parent: Node | None = None
     children: list[Node] = field(default_factory=list)
     atoms: list[Atom] = field(default_factory=list)
@@ -60,6 +62,19 @@ def parse_xml(raw: bytes) -> Node:
         if len(stack) >= 512:
             raise ValueError("XML nesting exceeds limit")
         node = Node(tag, attrs, parser.CurrentByteIndex, parent=stack[-1] if stack else None)
+        quote = None
+        for pos in range(node.start + 1, len(raw)):
+            char = raw[pos]
+            if quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in (ord('"'), ord("'")):
+                quote = char
+            elif char == ord(">"):
+                node.opening_end = pos + 1
+                break
+        if not node.opening_end:
+            raise ValueError("unterminated XML opening tag")
         if stack:
             stack[-1].children.append(node)
         else:
@@ -69,6 +84,8 @@ def parse_xml(raw: bytes) -> Node:
     def end(_tag):
         node = stack.pop()
         node.end = _tag_end(raw, parser.CurrentByteIndex, node.start)
+        node.closing_start = (node.opening_end if raw[node.opening_end - 2:node.opening_end] == b"/>"
+                              else parser.CurrentByteIndex)
 
     def start_cdata():
         nonlocal inside_cdata
