@@ -20,7 +20,9 @@ ARG NODE_X64_SHA256=dafe2e8f82cb97de1bd10db9e2ec4c07bbf53389b0799b1e095a918951e7
 ARG NODE_ARM64_SHA256=d68adf72c531f1118bee75b20ffbc5911accfda5e73454a798625464b40a4adf
 ARG C2PATOOL_URL=https://github.com/contentauth/c2pa-rs/releases/download/c2patool-v0.27.23/c2patool-v0.27.23-x86_64-unknown-linux-gnu.tar.gz
 ARG C2PATOOL_SHA256=7b8a09f85eeb4c8fe96ce00ffb6985209ebbb05fc39d6c13224a8b33547ba2a4
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
+RUN --mount=type=tmpfs,target=/var/lib/apt/lists \
+    --mount=type=tmpfs,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
 RUN set -eu; \
     case "$TARGETARCH" in \
       amd64) arch=x64; sha="$NODE_X64_SHA256" ;; \
@@ -45,6 +47,30 @@ RUN set -eu; \
       echo "WARNING: upstream c2patool v0.27.23 has no Linux arm64 release; C2PA inspection will be unavailable." >&2; \
     fi
 
+# Keep npm and its cache in a builder; only production dependencies reach the image.
+FROM downloads AS node_deps
+ENV PATH=/out/node/bin:${PATH}
+WORKDIR /build/subtext-scan
+COPY third_party/subtext-scan/package*.json ./
+RUN npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+
+# Editable installs reference this same source path in the final image.
+FROM python:3.12-slim-bookworm AS python_deps
+ENV PIP_NO_CACHE_DIR=1 UV_NO_CACHE=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /opt/doc-sentinel
+COPY pyproject.toml README.md LICENSE pins.lock.json ./
+COPY src/ ./src/
+COPY third_party/ ./third_party/
+# Prompt Guard, torch and Layer B are intentionally not installed. Do not
+# discard package data: perlecta and other adapters need it at runtime.
+RUN pip install uv \
+    && python -m venv --without-pip /opt/venv \
+    && uv pip install --python /opt/venv/bin/python -e '.[clean,detect]' \
+         -e 'third_party/perlecta-mcp[rendu]' -e third_party/unicode-smuggling-guard \
+    && mkdir /out \
+    && tar --exclude='__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
+         -C /opt -cf - venv | tar -C /out -xf -
+
 FROM python:3.12-slim-bookworm
 # The checkout has no published source URL in project metadata; callers may supply one.
 ARG SOURCE_URL=file:///opt/doc-sentinel
@@ -60,24 +86,39 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/tmp \
     TMPDIR=/tmp \
     NPM_CONFIG_CACHE=/tmp/.npm \
-    XDG_CACHE_HOME=/tmp/.cache
-RUN apt-get update && apt-get install -y --no-install-recommends \
+    XDG_CACHE_HOME=/tmp/.cache \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:${PATH}
+# Apt indexes and caches live only on build-time tmpfs mounts. Exclude new
+# package documentation/manpages while installing, not in a later image layer.
+RUN --mount=type=tmpfs,target=/var/lib/apt/lists \
+    --mount=type=tmpfs,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+      -o Dpkg::Options::='--path-exclude=/usr/share/doc/*' \
+      -o Dpkg::Options::='--path-exclude=/usr/share/man/*' \
+      -o Dpkg::Options::='--path-exclude=/usr/share/info/*' \
       tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng qpdf poppler-utils \
-      libimage-exiftool-perl util-linux ca-certificates curl git
-COPY --from=downloads /out/node/ /usr/local/
+      libimage-exiftool-perl libstdc++6 util-linux ca-certificates curl git
+# Separate layer exposes the actual size cost of rendering-safe sanitization.
+RUN --mount=type=tmpfs,target=/var/lib/apt/lists \
+    --mount=type=tmpfs,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+      -o Dpkg::Options::='--path-exclude=/usr/share/doc/*' \
+      -o Dpkg::Options::='--path-exclude=/usr/share/man/*' \
+      -o Dpkg::Options::='--path-exclude=/usr/share/info/*' \
+      libreoffice-writer-nogui fonts-dejavu-core fonts-liberation2 \
+      fonts-crosextra-carlito fonts-crosextra-caladea
+COPY --from=downloads /out/node/bin/node /usr/local/bin/node
 COPY --from=downloads /out/bin/ /usr/local/bin/
 COPY --from=downloads /out/c2patool-lib/ /opt/c2patool-lib/
-RUN pip install uv
+COPY --from=python_deps /out/venv/ /opt/venv/
 WORKDIR /opt/doc-sentinel
 # Allowlist the source needed at runtime instead of copying arbitrary root files.
 COPY pyproject.toml README.md LICENSE pins.lock.json ./
 COPY src/ ./src/
 COPY third_party/ ./third_party/
+COPY --from=node_deps /build/subtext-scan/node_modules/ ./third_party/subtext-scan/node_modules/
 COPY --from=chk_defaced /src/target/release/chk_defaced /opt/doc-sentinel/bin/chk_defaced
-# Prompt Guard, torch and Layer B are intentionally not installed.
-RUN UV_NO_CACHE=1 uv pip install --system -e '.[clean,detect]' \
-      -e 'third_party/perlecta-mcp[rendu]' -e third_party/unicode-smuggling-guard \
-    && (cd third_party/subtext-scan && npm ci --ignore-scripts --omit=dev --no-audit --no-fund)
 RUN groupadd --gid 10001 sentinel && useradd --uid 10001 --gid 10001 --home-dir /tmp --no-create-home sentinel
 USER 10001:10001
 WORKDIR /work
