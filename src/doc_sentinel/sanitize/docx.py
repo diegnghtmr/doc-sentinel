@@ -603,45 +603,76 @@ def _rendered_chars(pdf):
     return chars
 
 
-def _locate_widths(chars, text: str, reason: str, props: dict[str, Any]):
-    # Match complete, non-whitespace text in order; only normal spaces can be
-    # omitted at a rendered line boundary. All other missing characters fail closed.
-    if not text.strip() or text != text.strip() or any(c.isspace() and c != " " for c in text):
+def _median_space(chars) -> float | None:
+    spaces = sorted(c[2][2] - c[2][0] for c in chars if c[0] == " " and c[2][2] > c[2][0])
+    return spaces[len(spaces) // 2] if spaces else None
+
+
+def _locate_widths(chars, text: str, reason: str, props: dict[str, Any], cursor: int = 0):
+    """Measure a hidden run on the original render: ([(width_pt, spacing_twips)], cursor).
+
+    Complete non-space text is matched in render order. A unique match is used as is;
+    repeated text takes the first occurrence at or after ``cursor`` (runs are measured in
+    document order). Padding spaces add one space width each; only normal spaces may
+    be omitted at a rendered line boundary. Anything else fails closed (None) and the
+    run falls back to plain removal, leaving the render gate to decide.
+    """
+    if not text or any(c.isspace() and c != " " for c in text):
         return None
     color = _rgb(props.get("color"))
     expected_color = (color[0] << 16 | color[1] << 8 | color[2]) if color else None
     eligible = [c for c in chars if (c[3] < 4 if reason == "font smaller than 4 pt"
                                      else expected_color is not None and c[4] == expected_color)]
+    core = text.strip(" ")
+    if not core:
+        size = props.get("size")
+        same = [c for c in eligible if size is not None and abs(c[3] - size / 2) < 0.05]
+        space_width = _median_space(same)
+        if space_width is None:
+            return None
+        width = space_width * len(text)
+        return [(width, round((width - space_width) * 20))], cursor
+    padding = len(text) - len(text.lstrip(" ")), len(text) - len(text.rstrip(" "))
     nonspace = [index for index, char in enumerate(eligible) if not char[0].isspace()]
     rendered = "".join(eligible[index][0] for index in nonspace)
-    wanted = "".join(c for c in text if not c.isspace())
+    wanted = "".join(c for c in core if not c.isspace())
     start = rendered.find(wanted)
-    if start < 0 or rendered.find(wanted, start + 1) >= 0:
+    if start < 0:
         return None
+    if rendered.find(wanted, start + 1) >= 0:
+        start = rendered.find(wanted, cursor)
+        if start < 0:
+            return None
     selected = eligible[nonspace[start]:nonspace[start + len(wanted) - 1] + 1]
-    if (len({c[1][0] for c in selected}) != 1 or
-            len({(round(c[3], 2), c[4], c[5]) for c in selected}) != 1):
-        return None
-    spaces = [c[2][2] - c[2][0] for c in selected if c[0] == " " and c[2][2] > c[2][0]]
-    if not spaces:
+    style = {(round(c[3], 2), c[4], c[5]) for c in selected}
+    if len({c[1][0] for c in selected}) != 1 or len(style) != 1:
         return None
     # The PDF glyph box supplies the unexpanded advance of the same font's space.
-    space_width = sorted(spaces)[len(spaces) // 2]
+    space_width = _median_space(selected)
+    if space_width is None:
+        space_width = _median_space([c for c in eligible
+                                     if (round(c[3], 2), c[4], c[5]) in style])
+    if space_width is None:
+        return None
     groups: list[list] = []
     for char in selected:
         if not groups or groups[-1][0][1] != char[1]:
             groups.append([])
         groups[-1].append(char)
     widths = []
-    for group in groups:
+    for number, group in enumerate(groups):
         if any(a[2][0] > b[2][0] + 0.1 for a, b in pairwise(group)):
             return None
         width = group[-1][2][2] - group[0][2][0]
-        spacing = round((width - space_width) * 20)
-        if not math.isfinite(width) or not 0 < spacing <= 31680:
+        width += space_width * ((padding[0] if number == 0 else 0) +
+                                (padding[1] if number == len(groups) - 1 else 0))
+        # A segment narrower than one space (e.g. one glyph wrapped to its own line)
+        # keeps a plain space of the same formatting.
+        spacing = max(0, round((width - space_width) * 20))
+        if not math.isfinite(width) or width <= 0 or spacing > 31680:
             return None
         widths.append((width, spacing))
-    return widths
+    return widths, start + len(wanted)
 
 
 def _spaced_run(raw: bytes, run: Node, text: Node, spacing: int) -> bytes | None:
@@ -697,6 +728,7 @@ def _preserve_spaces(roots, entries, patches, pdf):
     defaults, styles, default_para = _styles(roots.get("word/styles.xml"))
     by_location = {(p.part, p.start, p.end): p for p in patches}
     replacements = {}
+    cursors: dict[str, int] = {}
     for part, root in roots.items():
         if part != "word/document.xml":
             continue  # headers, footers and other parts may be repeated in the render
@@ -710,9 +742,11 @@ def _preserve_spaces(roots, entries, patches, pdf):
                                                      "low-contrast foreground against effective background"}:
                 continue
             props = _run_properties(run, defaults, styles, default_para)
-            widths = _locate_widths(chars, patch.text, patch.reason, props)
-            if not widths:
+            located = _locate_widths(chars, patch.text, patch.reason, props,
+                                     cursors.get(patch.reason, 0))
+            if not located:
                 continue
+            widths, cursors[patch.reason] = located
             copies = [_spaced_run(entries[part], run, text, spacing) for _, spacing in widths]
             if any(copy is None for copy in copies):
                 continue
