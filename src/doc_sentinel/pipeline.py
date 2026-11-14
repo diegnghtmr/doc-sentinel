@@ -74,7 +74,8 @@ def _check_input(src: Path) -> Path:
 
 
 def run_detect(src: Path, *, allow_network: bool = False, fail_on: str = "high",
-               timeout_s: float = 180.0, prompt_guard: bool = False) -> tuple[dict[str, Any], int]:
+               timeout_s: float = 180.0, prompt_guard: bool = False,
+               review_targets=None) -> tuple[dict[str, Any], int]:
     src = _check_input(src)
     dtype = detect_type(src)
     report = new_report("detect", src, dtype)
@@ -116,6 +117,10 @@ def run_detect(src: Path, *, allow_network: bool = False, fail_on: str = "high",
     if sha256_file(src) != report["input"]["sha256"]:  # detect must be read-only
         report["warnings"].append("input changed during detect")
         report["verdict"], code = "error", 2
+    if review_targets is not None:
+        from doc_sentinel.review import write_plan
+
+        write_plan(review_targets, report, code, ctx.channels, verdict.findings, mandatory, fail_on)
     return report, code
 
 
