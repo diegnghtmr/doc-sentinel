@@ -16,9 +16,18 @@ from doc_sentinel.schema import EXCERPT_MAX, Finding, Location
 _SEP = r"[\s_-]+"
 _IA = r"(?:i\s*\.?\s*a\.?|inteligencia[\s_-]+artificial|lenguaje)"
 
-_PRODUCT = r"(?:chatgpt|gpt(?:[\s_-]*\d[\w.]*)?|claude|gemini|copilot|bard|llama|dan|grok|mistral)"
+# Product names that are never ordinary words or first names count on their own; "claude"
+# and "dan" are also first names, so they need a vendor prefix or a jailbreak-style
+# continuation ("Claude with no restrictions") rather than a surname ("Claude Monet").
+_PRODUCT_UNAMBIGUOUS = r"(?:chatgpt|gpt(?:[\s_-]*\d[\w.]*)?|copilot|gemini|bard|grok|mistral|llama)"
+_PRODUCT_AMBIGUOUS = r"(?:claude|dan)"
+_VENDOR = r"(?:microsoft|openai|google|anthropic|meta)"
 _LIMITLESS_ES = rf"sin{_SEP}(?:restricciones|reglas|limites|filtros|censura)"
 _LIMITLESS_EN = rf"(?:without|with{_SEP}no){_SEP}(?:rules|restrictions|limits|filters|censorship)"
+# What may follow an AI role: end, punctuation, or a jailbreak-style continuation, never a
+# further noun ("a senior AI researcher", "un asistente virtual de la clinica" stay prose).
+_ROLE_END = (rf"(?=\s*(?:$|[^\w\s]|(?:sin|without|with{_SEP}no|que|y|and|who|that|which|"
+             rf"named|called|llamad[oa]|in{_SEP}developer|en{_SEP}modo)\b))")
 _ADJ_ES = (rf"(?:(?!(?:en|de|del|para|con|sobre|y|o|que|a)\b)[a-z]+{_SEP}){{0,2}}?")
 _ADJ_EN = (rf"(?:(?!(?:in|of|for|on|about|at|with|to|and|or|that|from)\b)[a-z]+{_SEP}){{0,2}}?")
 # Generic nouns (sistema, modelo, asistente, agente) only count when qualified as AI or
@@ -26,15 +35,15 @@ _ADJ_EN = (rf"(?:(?!(?:in|of|for|on|about|at|with|to|and|or|that|from)\b)[a-z]+{
 _ROLE_ES = (rf"(?:{_IA}|chatbot|bot)(?!\w)"
             rf"|(?:sistema|modelo|programa|herramienta|asistente|agente){_SEP}"
             rf"(?:(?:de|basado{_SEP}en){_SEP}{_IA}(?!\w)|{_LIMITLESS_ES}\b)"
-            rf"|(?:asistente|agente){_SEP}virtual\b")
-_ROLE_EN = (rf"(?:ai|chatbot|bot|(?:language|ai){_SEP}model)\b"
+            rf"|(?:asistente|agente){_SEP}virtual{_ROLE_END}")
+_ROLE_EN = (rf"(?:ai(?:{_SEP}(?:assistant|model|system|chatbot|agent|bot))?|chatbot|bot"
+            rf"|language{_SEP}model){_ROLE_END}"
             rf"|(?:helpful|unrestricted|uncensored|jailbroken|virtual|evil){_SEP}"
-            rf"(?:assistant|agent)\b"
+            rf"(?:assistant|agent){_ROLE_END}"
             rf"|(?:assistant|agent){_SEP}{_LIMITLESS_EN}\b")
-# A product name is a role only when nothing but punctuation or a connective follows, so
-# "Eres ahora Claude Monet" (a painter) is not flagged.
-_PRODUCT_ROLE = (rf"(?:(?:microsoft|openai|google|anthropic|meta){_SEP})?{_PRODUCT}(?!\w)"
-                 r"(?=\s*(?:$|[^\w\s]|(?:sin|without|que|who|and|y|an?|una?|el|la|the)\b))")
+_PRODUCT_ROLE = (rf"(?:{_VENDOR}{_SEP}(?:{_PRODUCT_UNAMBIGUOUS}|{_PRODUCT_AMBIGUOUS})(?!\w)"
+                 rf"|{_PRODUCT_UNAMBIGUOUS}(?!\w)"
+                 rf"|{_PRODUCT_AMBIGUOUS}(?!\w){_ROLE_END})")
 
 # Declaration order is the stable order used for evidence.rules. Family D is
 # contextual: it is included only when family A also occurs in that channel.
@@ -85,7 +94,7 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
 _EMAIL = r"[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8}"  # bounded: no backtracking blowup
 # Complete destinations (scheme, host and path; bounded) so an invisible character anywhere
 # inside the URL or e-mail is checked for obfuscation. Markdown links "[text](url)" too.
-_URL = r"(?:https?://|www\.)[^\s<>\"'()\[\]]{1,2048}"
+_URL = (r"(?:https?://|www\.)(?:[^\s<>\"'()\[\]]|\([^\s<>\"'()\[\]]{0,256}\)){1,2048}")
 _DESTINATION = (rf"(?:[<\"'«(\[]?(?:{_URL}|{_EMAIL})"
                 rf"|\[[^\[\]\n]{{0,120}}\]\(\s*{_URL})")
 # Separate prefix and destination searches avoid quadratic backtracking on a
