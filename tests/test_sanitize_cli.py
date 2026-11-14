@@ -73,7 +73,10 @@ def test_generated_hidden_exam_is_sanitized_and_summary_never_exposes_removed_te
     assert sum(safe["sanitize"]["counts"]["visibility"].values()) == len(actions)
     for action in actions:
         assert set(action) == {"format", "part", "location", "technique", "visibility", "reason",
-                               "bytes_removed", "removed_text"}
+                               "bytes_removed", "removed_text", "space_preserved",
+                               "spacer_width_pt"}
+        assert isinstance(action["space_preserved"], bool)
+        assert (action["spacer_width_pt"] > 0) == action["space_preserved"]
         assert action["removed_text"] and action["removed_text"] not in stdout
 
 
