@@ -19,8 +19,9 @@ _IA = r"(?:i\s*\.?\s*a\.?|inteligencia[\s_-]+artificial|lenguaje)"
 # contextual: it is included only when family A also occurs in that channel.
 _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in (
     ("ai_addressed_es", "a", (rf"\bsi{_SEP}eres{_SEP}(?:una|un){_SEP}"
-        rf"(?:herramienta|modelo|asistente|sistema|programa|chatbot|agente){_SEP}"
-        rf"(?:de{_SEP})?{_IA}(?!\w)")),
+        rf"(?:{_IA}|modelo(?:{_SEP}(?:de{_SEP})?{_IA})?|"
+        rf"(?:herramienta|asistente|sistema|programa|chatbot|agente){_SEP}"
+        rf"(?:de{_SEP})?{_IA})(?!\w)")),
     ("ai_passive_es", "a", (rf"\bsi{_SEP}(?:este{_SEP}documento{_SEP})?"
         rf"(?:esta{_SEP}siendo|es){_SEP}"
         rf"(?:desarrollado|resuelto|procesado|leido|analizado){_SEP}por{_SEP}"
@@ -77,6 +78,21 @@ def _fold(text: str) -> str:
     return re.sub(r"\s+", " ", stripped)
 
 
+def _filename_source(filename: str) -> tuple[str, list[int]]:
+    """Separate filename words while retaining offsets into the untrusted original."""
+    stem = filename[:len(filename) - len(Path(filename).suffix)]
+    chars: list[str] = []
+    offsets: list[int] = []
+    for i, char in enumerate(stem):
+        if i and char.isupper() and (stem[i - 1].islower() or (
+                stem[i - 1].isupper() and i + 1 < len(stem) and stem[i + 1].islower())):
+            chars.append(" ")
+            offsets.append(i)
+        chars.append(" " if char in "-_." else char)
+        offsets.append(i)
+    return "".join(chars), offsets
+
+
 def _original_span(text: str, start: int, end: int) -> tuple[int, int]:
     """Map folded offsets back to original text, including stripped format characters."""
     position = 0
@@ -111,7 +127,9 @@ class InstructionPhrasesAdapter:
     def inspect(self, src: Path, ctx: RunContext) -> list[Finding]:
         findings = []
         for channel in ctx.channels:
-            text = _fold(channel.text)
+            source, offsets = (_filename_source(channel.text) if channel.channel == "filename"
+                               else (channel.text, None))
+            text = _fold(source)
             matches = []
             for name, family, pattern in _RULES:
                 match = pattern.search(text)
@@ -131,19 +149,25 @@ class InstructionPhrasesAdapter:
             has_condition = any(family == "a" for _, family, _, _ in matches)
             matches = [item for item in matches if item[1] != "d" or has_condition]
             _, _, first_start, first_end = min(matches, key=lambda item: item[2])
-            start, end = _original_span(channel.text, first_start, first_end)
+            start, end = _original_span(source, first_start, first_end)
+            # Invisible format characters inside the matched instruction are deliberate
+            # evasion: a document that merely discusses injection does not do that.
+            obfuscated = any(unicodedata.category(c) == "Cf" for c in source[start:end])
+            if offsets is not None:
+                start, end = offsets[start], offsets[end - 1] + 1
             left = max(0, start - 120)
             right = min(len(channel.text), end + 120, left + EXCERPT_MAX)
             findings.append(Finding(
                 adapter=self.id, adapter_code="INSTRUCTION_PHRASES",
                 cls=_CLASSES.get(channel.channel, "prompt_injection"),
-                severity="high" if channel.hidden or channel.channel in _HIGH_CHANNELS else "medium",
+                severity=("high" if channel.hidden or obfuscated
+                          or channel.channel in _HIGH_CHANNELS else "medium"),
                 confidence="heuristic",
                 location=Location(file=src.name, channel=channel.channel, pointer=channel.pointer,
                                   page=channel.page),
                 excerpt=channel.text[left:right],
                 evidence={"rules": [name for name, _, _, _ in matches], "hidden": channel.hidden,
-                          "matched": channel.text[start:end][:160]},
+                          "obfuscated": obfuscated, "matched": channel.text[start:end][:160]},
             ))
         return findings
 
