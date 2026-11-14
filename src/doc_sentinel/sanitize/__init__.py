@@ -35,7 +35,8 @@ def _normalized(text: str) -> str:
 
 
 def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None,
-             workdir: Path, has_glyph_divergence: bool = False,
+             hidden_regions: list[dict] | None = None, workdir: Path,
+             has_glyph_divergence: bool = False,
              has_unlocatable_hidden: bool = False) -> SanitizeResult:
     """Create a checked sanitized copy, or refuse without modifying either path.
 
@@ -57,9 +58,16 @@ def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None
                 "glyph/ToUnicode divergence lacks unambiguous mapping provenance"))
         if has_unlocatable_hidden:
             return SanitizeResult("refused", refusal_reason="detected hidden content cannot be located")
-        target = pin_target(dest, protect=(src,))
         kind = detect_type(src)
         spans = injection_spans if injection_spans is not None else []
+        if kind == "pdf":
+            if dest.suffix.lower() != ".docx":
+                return SanitizeResult("unsupported", refusal_reason="PDF output must end in .docx")
+            from doc_sentinel.sanitize.pdf_to_docx import pdf_to_docx
+
+            return pdf_to_docx(src, dest, workdir=workdir, hidden_regions=hidden_regions,
+                               injection_spans=spans, has_glyph_divergence=has_glyph_divergence)
+        target = pin_target(dest, protect=(src,))
         if kind == "docx":
             from doc_sentinel.sanitize.docx import sanitize_docx
 
@@ -70,10 +78,7 @@ def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None
                 atomic_write_bytes(target, outcome.data)
             return SanitizeResult(outcome.status, outcome.actions, outcome.checks, outcome.reason)
         if kind not in {"txt", "md", "html"}:
-            reason = f"sanitize unsupported for {kind}"
-            if kind == "pdf":
-                reason += ": position-preserving content-stream editor is unavailable"
-            return SanitizeResult("unsupported", refusal_reason=reason)
+            return SanitizeResult("unsupported", refusal_reason=f"sanitize unsupported for {kind}")
         original = src.read_bytes().decode("utf-8")
         non_inline = False
         if kind == "html":

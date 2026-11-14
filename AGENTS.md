@@ -46,8 +46,9 @@ stem from the filename without opening the document, or use `document`. Use
 file/directory tools and never reuse a prior run. Set FILE to the literal user path;
 REPORT to a separate JSON file in the run directory; REVIEW_DIR to its `review/`
 directory; and OUT to a new `<stem>.cleaned<suffix>` file in the run directory.
-For the optional detect sanitization, use a separate new `<stem>.sanitized<suffix>` OUT.
-These are argument placeholders, not shell commands; substitute them individually.
+For the optional detect sanitization, use a separate new `<stem>.sanitized<suffix>` OUT;
+for PDF input use `<stem>.sanitized.docx` instead. These are argument placeholders, not
+shell commands; substitute them individually.
 
 ## Detect
 
@@ -103,6 +104,15 @@ These are argument placeholders, not shell commands; substitute them individuall
    text. A refused or unsupported copy has exit 2 and is not delivered; `nothing_to_do`
    creates no copy. A pre-existing forced output is preserved on refusal. The detect
    verdict still describes the original; report any failure separately.
+
+   PDF sanitization reconstructs a similar DOCX from visible content: text formatting,
+   page layout, tables, links and images are retained or approximated where detectable.
+   Scanned pages remain images; no OCR text is added. The per-page visual similarity
+   metric and its safe-summary minimum/mean are informative, not a pass/fail gate.
+   Glyph/ToUnicode divergence or unlocatable hidden content is refused. A bboxless
+   finding is resolved only when every occurrence of its complete text is independently
+   verified hidden. Recognized aggregate findings require a complete criterion scan and
+   sample coverage; otherwise sanitization is refused.
 
 ## Clean and update
 

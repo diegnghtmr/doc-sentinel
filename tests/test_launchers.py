@@ -39,7 +39,7 @@ class Harness:
         self.bin.mkdir()
         if backend == "sh":
             # Never fall through to a real Docker CLI, including the missing-Docker case.
-            for tool in ("dirname", "basename", "realpath", "uname", "id", "mkdir"):
+            for tool in ("dirname", "basename", "realpath", "uname", "id", "mkdir", "head", "grep"):
                 (self.bin / tool).symlink_to(shutil.which(tool))
         fake = ROOT / "tests" / "launchers" / ("fake-docker.py" if backend == "sh" else "fake-docker.ps1")
         shutil.copyfile(fake, self.bin / "docker")
@@ -211,6 +211,42 @@ class LauncherScenarios:
             expected.append("--sanitize")
         assert forwarded == expected
         assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    @pytest.mark.parametrize("mode", ["detect", "sanitize"])
+    @pytest.mark.parametrize("suffix", [".pdf", ".PDF"])
+    def test_pdf_default_sanitized_output_is_docx_on_host(self, harness, mode, suffix):
+        src = harness.input_dir / f"source file{suffix}"
+        src.write_bytes(b"%PDF-1.7\nsynthetic PDF input")
+        review = harness.report_dir / "review"
+        review.mkdir()
+        args = [mode, src, "--agent-summary"]
+        args += ["--sanitize"] if mode == "detect" else ["--review-dir", review]
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        output = harness.input_dir / "source file.sanitized.docx"
+        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(output)}" in recorded
+        assert "/work/out/source file.sanitized.docx" in recorded
+        assert src.read_bytes() == b"%PDF-1.7\nsynthetic PDF input"
+
+    @pytest.mark.parametrize("mode", ["detect", "sanitize"])
+    @pytest.mark.parametrize("name,data,output", [
+        ("source", b"%PDF-1.7\nsynthetic", "source.sanitized.docx"),
+        ("source.bin", b"%PDF-1.7\nsynthetic", "source.sanitized.docx"),
+        ("source.pdf", b"ordinary synthetic text", "source.sanitized.pdf"),
+    ])
+    def test_sanitize_default_type_comes_from_content(self, harness, mode, name, data, output):
+        src = harness.input_dir / name
+        src.write_bytes(data)
+        review = harness.report_dir / "review"
+        review.mkdir()
+        args = [mode, src, "--agent-summary"]
+        args += ["--sanitize"] if mode == "detect" else ["--review-dir", review]
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(harness.input_dir / output)}" in recorded
+        assert f"/work/out/{output}" in recorded and src.read_bytes() == data
 
     def test_clean_agent_summary_is_forwarded(self, harness):
         result = harness.run("clean", harness.input, "--agent-summary")

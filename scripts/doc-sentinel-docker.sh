@@ -111,6 +111,13 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
                 .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.$suffix" ;; *) out_name="${in_name%.*}.$suffix.${in_name##*.}" ;; esac ;;
                 *) out_name="$in_name.$suffix" ;;
             esac
+            if [ "$sanitized" -eq 1 ] && LC_ALL=C head -c 1024 "$input" | LC_ALL=C grep -q '%PDF-'; then
+                stem=$in_name
+                case "$in_name" in
+                    .*.*|?*.*) case "$in_name" in *.) ;; *) stem=${in_name%.*} ;; esac ;;
+                esac
+                out_name="$stem.sanitized.docx"
+            fi
             output=$in_dir/$out_name
         fi
         output=$(resolve_path "$output") || fail 'output directory does not exist'
