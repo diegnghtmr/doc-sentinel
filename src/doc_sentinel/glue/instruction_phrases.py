@@ -5,6 +5,7 @@ examples, so only hidden or non-body channels are assigned high severity.
 """
 from __future__ import annotations
 
+import bisect
 import re
 import unicodedata
 from pathlib import Path
@@ -14,6 +15,8 @@ from doc_sentinel.schema import EXCERPT_MAX, Finding, Location
 
 _SEP = r"[\s_-]+"
 _IA = r"(?:i\s*\.?\s*a\.?|inteligencia[\s_-]+artificial|lenguaje)"
+
+_PRODUCT = r"(?:chatgpt|gpt(?:[\s_-]*\d[\w.]*)?|claude|gemini|copilot|bard|llama|dan|grok|mistral)"
 
 # Declaration order is the stable order used for evidence.rules. Family D is
 # contextual: it is included only when family A also occurs in that channel.
@@ -38,11 +41,16 @@ _RULES = tuple((name, family, re.compile(pattern)) for name, family, pattern in 
     ("disregard_en", "b", rf"\bdisregard(?:{_SEP}[a-z]+){{0,6}}{_SEP}instructions\b"),
     ("forget_en", "b", rf"\bforget{_SEP}(?:everything|all){_SEP}(?:above|before)\b"),
     ("system_prompt", "c", rf"\bsystem{_SEP}prompt\b"),
-    # Role hijack needs a target role; "eres ahora mayor de edad" is ordinary prose.
-    ("role_es", "c", (rf"\b(?:eres{_SEP}ahora|ahora{_SEP}eres){_SEP}(?:un|una|el|la){_SEP}"
-        rf"(?:[a-z]+{_SEP}){{0,2}}?(?:{_IA}|asistente|modelo|agente|chatbot|bot|sistema)(?!\w)")),
-    ("role_en", "c", (rf"\byou{_SEP}are{_SEP}now{_SEP}(?:(?:an?|the){_SEP})?"
-        rf"(?:[a-z]+{_SEP}){{0,2}}?(?:ai|assistant|model|chatbot|agent|bot|dan)\b")),
+    # Role hijack needs an explicit AI role or a product name; ordinary prose such as
+    # "eres ahora mayor de edad" or "ahora eres un modelo a seguir" must not match.
+    ("role_es", "c", (rf"\b(?:eres{_SEP}ahora|ahora{_SEP}eres){_SEP}(?:"
+        rf"(?:un|una|el|la){_SEP}(?:(?:nuevo|nueva|otro|otra){_SEP})?"
+        rf"(?:{_IA}|asistente|agente|chatbot|bot|modelo{_SEP}(?:de{_SEP})?{_IA})"
+        rf"|{_PRODUCT})(?!\w)")),
+    ("role_en", "c", (rf"\byou{_SEP}are{_SEP}now{_SEP}(?:"
+        rf"(?:an?|the){_SEP}(?:(?:new|unrestricted|helpful|different){_SEP})?"
+        rf"(?:ai|assistant|chatbot|agent|bot|(?:language|ai){_SEP}model)"
+        rf"|{_PRODUCT})(?!\w)")),
     ("new_instructions_en", "c", rf"\bnew{_SEP}instructions\s*:"),
     ("new_instructions_es", "c", rf"\bnuevas{_SEP}instrucciones\s*:"),
     ("system_token", "c", r"\[system\]"),
@@ -62,8 +70,8 @@ _EMAIL = r"[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8}"  # bou
 # Separate prefix and destination searches avoid quadratic backtracking on a
 # hostile channel containing many exfiltration prefixes but no destination.
 _EXFIL_DESTINATIONS = {
-    "exfiltration_en": re.compile(rf"\bto{_SEP}(?:https?\b|www\b|{_EMAIL})"),
-    "exfiltration_es": re.compile(rf"\ba{_SEP}(?:https?\b|www\b|{_EMAIL})"),
+    "exfiltration_en": re.compile(rf"\bto{_SEP}[<\"'«(\[]?(?:https?\b|www\b|{_EMAIL})"),
+    "exfiltration_es": re.compile(rf"\ba{_SEP}[<\"'«(\[]?(?:https?\b|www\b|{_EMAIL})"),
     "markdown_image": re.compile(r"\]\(\s*https?\b"),
 }
 
@@ -75,11 +83,52 @@ _CLASSES = {"filename": "filename_injection", "metadata": "metadata_injection",
             "alt": "link_or_alt_injection", "hyperlink": "link_or_alt_injection"}
 
 
+class _Folded:
+    """Folded text plus a map back to the original, built in one pass.
+
+    ``origin[i]`` is the original index of folded char ``i`` and ``cf_prefix[j]`` counts the
+    invisible format characters (Unicode category Cf) in ``source[:j]``, so mapping a match
+    and asking "is there an invisible char inside it?" are O(1) per match.
+    """
+
+    __slots__ = ("cf_prefix", "length", "origin", "text")
+
+    def __init__(self, source: str) -> None:
+        chars: list[str] = []
+        origin: list[int] = []
+        cf_prefix = [0]
+        last_space = False
+        for i, char in enumerate(source):
+            cf_prefix.append(cf_prefix[-1] + (unicodedata.category(char) == "Cf"))
+            normalized = unicodedata.normalize(
+                "NFD", unicodedata.normalize("NFKC", char).casefold())
+            for folded_char in normalized:
+                if unicodedata.category(folded_char) in {"Mn", "Cf"}:
+                    continue
+                is_space = folded_char.isspace()
+                if is_space and last_space:
+                    continue
+                last_space = is_space
+                chars.append(" " if is_space else folded_char)
+                origin.append(i)
+        self.text = "".join(chars)
+        self.origin = origin
+        self.cf_prefix = cf_prefix
+        self.length = len(source)
+
+    def span(self, start: int, end: int) -> tuple[int, int]:
+        """Original [start, end) covering folded [start, end), stripped chars included."""
+        if start >= len(self.origin) or end <= start:
+            return 0, self.length
+        return self.origin[start], self.origin[end - 1] + 1
+
+    def obfuscated(self, start: int, end: int) -> bool:
+        first, last = self.span(start, end)
+        return self.cf_prefix[last] - self.cf_prefix[first] > 0
+
+
 def _fold(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    decomposed = unicodedata.normalize("NFD", normalized)
-    stripped = "".join(c for c in decomposed if unicodedata.category(c) not in {"Mn", "Cf"})
-    return re.sub(r"\s+", " ", stripped)
+    return _Folded(text).text
 
 
 def _filename_source(filename: str) -> tuple[str, list[int]]:
@@ -97,40 +146,23 @@ def _filename_source(filename: str) -> tuple[str, list[int]]:
     return "".join(chars), offsets
 
 
-def _any_obfuscated(source: str, folded: str, rule_names: set[str]) -> bool:
-    """True when an invisible format char sits inside any occurrence of a matched rule."""
-    for name, _family, pattern in _RULES:
-        if name not in rule_names:
-            continue
-        for match in pattern.finditer(folded):
-            start, end = _original_span(source, match.start(), match.end())
-            if any(unicodedata.category(c) == "Cf" for c in source[start:end]):
-                return True
-    return False
+def _rule_spans(name: str, pattern: re.Pattern[str], folded: str) -> list[tuple[int, int]]:
+    """Every occurrence of a rule; exfiltration spans run to the next destination.
 
-
-def _original_span(text: str, start: int, end: int) -> tuple[int, int]:
-    """Map folded offsets back to original text, including stripped format characters."""
-    position = 0
-    begin = None
-    last_space = False
-    for i, char in enumerate(text):
-        normalized = unicodedata.normalize("NFD", unicodedata.normalize("NFKC", char).casefold())
-        for folded_char in normalized:
-            if unicodedata.category(folded_char) in {"Mn", "Cf"}:
-                continue
-            is_space = folded_char.isspace()
-            if is_space and last_space:
-                continue
-            last_space = is_space
-            if position == start:
-                begin = i
-            position += 1
-            if position == end:
-                return begin if begin is not None else i, i + 1
-    # Rare cross-character compatibility compositions can make offsets differ;
-    # keep a bounded excerpt instead of failing the whole channel.
-    return (begin if begin is not None else 0), len(text)
+    Destinations are collected once and paired with bisect, so a hostile channel with many
+    prefixes and no destination stays linear.
+    """
+    destination = _EXFIL_DESTINATIONS.get(name)
+    if destination is None:
+        return [(m.start(), m.end()) for m in pattern.finditer(folded)]
+    targets = [(m.start(), m.end()) for m in destination.finditer(folded)]
+    starts = [t[0] for t in targets]
+    spans = []
+    for match in pattern.finditer(folded):
+        k = bisect.bisect_left(starts, match.end())
+        if k < len(targets):
+            spans.append((match.start(), targets[k][1]))
+    return spans
 
 
 class InstructionPhrasesAdapter:
@@ -145,31 +177,26 @@ class InstructionPhrasesAdapter:
         for channel in ctx.channels:
             source, offsets = (_filename_source(channel.text) if channel.channel == "filename"
                                else (channel.text, None))
-            text = _fold(source)
+            folded = _Folded(source)
+            text = folded.text
             matches = []
+            hidden_in: set[str] = set()
             for name, family, pattern in _RULES:
-                match = pattern.search(text)
-                if match is None:
+                spans = _rule_spans(name, pattern, text)
+                if not spans:
                     continue
-                destination = _EXFIL_DESTINATIONS.get(name)
-                if destination is not None:
-                    end_match = destination.search(text, match.end())
-                    if end_match is None:
-                        continue
-                    end = end_match.end()
-                else:
-                    end = match.end()
-                matches.append((name, family, match.start(), end))
+                matches.append((name, family, spans[0][0], spans[0][1]))
+                # Invisible format characters inside ANY occurrence of a matched rule,
+                # destination included, are deliberate evasion.
+                if any(folded.obfuscated(a, b) for a, b in spans):
+                    hidden_in.add(name)
             if not any(family in {"a", "b", "c", "e"} for _, family, _, _ in matches):
                 continue
             has_condition = any(family == "a" for _, family, _, _ in matches)
             matches = [item for item in matches if item[1] != "d" or has_condition]
             _, _, first_start, first_end = min(matches, key=lambda item: item[2])
-            start, end = _original_span(source, first_start, first_end)
-            # Invisible format characters inside ANY matched instruction occurrence (not only
-            # the first one) are deliberate evasion: a document that merely discusses
-            # injection does not do that.
-            obfuscated = _any_obfuscated(source, text, {name for name, _, _, _ in matches})
+            start, end = folded.span(first_start, first_end)
+            obfuscated = any(name in hidden_in for name, _, _, _ in matches)
             if offsets is not None:
                 start, end = offsets[start], offsets[end - 1] + 1
             left = max(0, start - 120)
