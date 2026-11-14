@@ -15,6 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PDF cleaning verifies and, without exiftool, rewrites AI metadata in the output copy.
+clean = [
+    "pikepdf>=8",
+    "pymupdf>=1.24",
+]
 # Runtime deps of the pinned sub-harnesses that run as child processes in this venv.
 detect = [
     "pikepdf>=8",
@@ -29,6 +34,8 @@ promptguard = [
     "huggingface_hub>=0.30.2",
 ]
 dev = [
+    "pikepdf>=8",
+    "pymupdf>=1.24",
     "pytest>=8",
     "ruff>=0.5",
     "reportlab>=4",

@@ -17,7 +17,6 @@ services:
     volumes:
       - ../work/in:/work/in:ro
       - ../work/out:/work/out
-      - ${HF_CACHE:-~/.cache/huggingface}:/models:ro
   clean:
     build:
       context: ..

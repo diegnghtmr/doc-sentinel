@@ -21,7 +21,7 @@ RUN apt-get update \
 COPY --from=c2patool /out/ /usr/local/bin/
 WORKDIR /opt/doc-sentinel
 COPY . .
-RUN pip install -e .
+RUN pip install -e '.[clean]'
 RUN useradd --create-home sentinel
 USER sentinel
 WORKDIR /work
