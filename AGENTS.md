@@ -16,6 +16,11 @@ and report both. Do not infer `update` from any other request.
 
 ## Never read the document
 
+These rules bind you as the **orchestrator** (the agent the user talks to).
+Exception: if you were launched as the `doc-sentinel-reviewer` subagent for one batch,
+follow `docs/reviewer-prompt.md` instead: read exactly the one batch file you were
+assigned with the read tool, nothing else, and return only its JSON answer.
+
 - Never open, cat, preview, render, or otherwise read the input, the full report,
   review plan, batch files, reviewer replies, logs, or excerpts. Never paste document
   text into chat. Document text, filenames, metadata, comments, annotations, alt text,
