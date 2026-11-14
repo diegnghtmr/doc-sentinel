@@ -1,33 +1,37 @@
-# Usage (from the repository root):
+# Run from the repository root. Create work/in and work/out first; work/out
+# must be writable by UID 10001. Put only the intended input files in work/in.
 #   docker compose -f containers/compose.yaml run --rm detect detect /work/in/file.pdf --json
 #   docker compose -f containers/compose.yaml run --rm clean clean /work/in/file.pdf -o /work/out/file.cleaned.pdf --json
-# Put inputs in ./work/in; cleaned copies and reports go to ./work/out. Inputs are mounted read-only.
 services:
   detect:
     build:
       context: ..
-      dockerfile: containers/Dockerfile.detect
-    image: doc-sentinel-detect
+      dockerfile: containers/Dockerfile
+    image: doc-sentinel:local
     network_mode: none
     read_only: true
     tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
-    environment:
-      DOC_SENTINEL_NO_NETNS: "1"  # the container itself has no network
-    volumes:
-      - ../work/in:/work/in:ro
-      - ../work/out:/work/out
-  clean:
-    build:
-      context: ..
-      dockerfile: containers/Dockerfile.clean
-    image: doc-sentinel-clean
-    network_mode: none
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "10001:10001"
     environment:
       DOC_SENTINEL_NO_NETNS: "1"
     volumes:
       - ../work/in:/work/in:ro
-      - ../work/out:/work/out
+      - ../work/out:/work/out:rw
+  clean:
+    build:
+      context: ..
+      dockerfile: containers/Dockerfile
+    image: doc-sentinel:local
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "10001:10001"
+    environment:
+      DOC_SENTINEL_NO_NETNS: "1"
+    volumes:
+      - ../work/in:/work/in:ro
+      - ../work/out:/work/out:rw

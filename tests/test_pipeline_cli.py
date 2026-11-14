@@ -701,3 +701,12 @@ def test_matrix_defaults_to_rules_not_prompt_guard(dtype):
     assert "instruction-phrases" in (mandatory if dtype in {
         "txt", "md", "html", "pdf", "docx", "image", "svg"} else optional)
     assert "instruction-phrases" in registry.CHANNEL_ADAPTERS
+
+
+def test_version_without_git_metadata_reports_pins_not_mismatch(monkeypatch, capsys):
+    from doc_sentinel import cli as cli_module
+    monkeypatch.setattr(cli_module, "checkout_sha", lambda root, path: None)
+    code, out, _ = run(["version"], capsys)
+    assert code == 0
+    assert "MISMATCH" not in out
+    assert "pinned (no git checkout to compare)" in out
