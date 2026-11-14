@@ -22,29 +22,29 @@ ADAPTERS: dict[str, str] = {
     "chk_defaced": "doc_sentinel.adapters.chk_defaced:ChkDefacedAdapter",
     "unicode-smuggling-guard":
         "doc_sentinel.adapters.unicode_smuggling_guard:UnicodeSmugglingGuardAdapter",
+    "instruction-phrases": "doc_sentinel.glue.instruction_phrases:InstructionPhrasesAdapter",
     "prompt-guard": "doc_sentinel.adapters.llamafirewall_pg:PromptGuardAdapter",
 }
 
-# Adapters that consume extracted text channels run after the document layer, so that
-# hidden text revealed by perlecta & co. is also fed to the Unicode scanner and classifier.
-CHANNEL_ADAPTERS = frozenset({"unicode-smuggling-guard", "prompt-guard"})
+# Channel adapters run after document adapters, including on their revealed text.
+CHANNEL_ADAPTERS = frozenset({"unicode-smuggling-guard", "instruction-phrases", "prompt-guard"})
 
-# PLAN §11. (mandatory, optional) per detected type.
+# PLAN §11 and S4/L20. (mandatory, optional) per detected type.
 DETECT_MATRIX: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "txt": (("unicode-smuggling-guard", "prompt-guard"), ("subtext-scan",)),
-    "md": (("unicode-smuggling-guard", "prompt-guard"), ("subtext-scan",)),
-    "html": (("subtext-scan", "unicode-smuggling-guard", "prompt-guard"), ("chk_defaced",)),
+    "txt": (("unicode-smuggling-guard", "instruction-phrases"), ("subtext-scan",)),
+    "md": (("unicode-smuggling-guard", "instruction-phrases"), ("subtext-scan",)),
+    "html": (("subtext-scan", "unicode-smuggling-guard", "instruction-phrases"), ("chk_defaced",)),
     "pdf": (("perlecta", "hidden-text-detector", "chk_defaced", "unicode-smuggling-guard",
-             "prompt-guard"), ("subtext-scan",)),
+             "instruction-phrases"), ("subtext-scan",)),
     "docx": (("perlecta", "hidden-text-detector", "chk_defaced", "unicode-smuggling-guard",
-              "prompt-guard"), ("subtext-scan",)),
-    "eml": (("perlecta",), ("unicode-smuggling-guard", "prompt-guard")),
-    "xlsx": ((), ("unicode-smuggling-guard", "prompt-guard")),
-    "pptx": ((), ("unicode-smuggling-guard", "prompt-guard")),
-    "epub": ((), ("unicode-smuggling-guard", "prompt-guard")),
-    "odt": ((), ("unicode-smuggling-guard", "prompt-guard")),
-    "image": (("unicode-smuggling-guard", "prompt-guard"), ()),
-    "svg": (("unicode-smuggling-guard", "prompt-guard"), ("subtext-scan",)),
+              "instruction-phrases"), ("subtext-scan",)),
+    "eml": (("perlecta",), ("unicode-smuggling-guard", "instruction-phrases")),
+    "xlsx": ((), ("unicode-smuggling-guard", "instruction-phrases")),
+    "pptx": ((), ("unicode-smuggling-guard", "instruction-phrases")),
+    "epub": ((), ("unicode-smuggling-guard", "instruction-phrases")),
+    "odt": ((), ("unicode-smuggling-guard", "instruction-phrases")),
+    "image": (("unicode-smuggling-guard", "instruction-phrases"), ()),
+    "svg": (("unicode-smuggling-guard", "instruction-phrases"), ("subtext-scan",)),
 }
 
 KNOWN_GAPS: dict[str, str] = {
@@ -54,7 +54,7 @@ KNOWN_GAPS: dict[str, str] = {
             "extracted text is scanned.",
     "epub": "EPUB: detection is partial (PLAN §11); only extracted text is scanned.",
     "odt": "ODT: detection is partial (PLAN §11); only extracted text is scanned.",
-    "image": "Images: OCR + classifier only; pixel watermarks/steganography are not analysed.",
+    "image": "Images: OCR + channel rules only; pixel watermarks/steganography are not analysed.",
 }
 
 CLEAN_MATRIX: dict[str, tuple[str, ...]] = {

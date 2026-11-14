@@ -133,7 +133,7 @@ def test_manifest_is_complete_and_generator_is_reproducible(corpus_directory):
 
 @pytest.mark.parametrize("item", DETECT, ids=lambda item: item["file"])
 def test_detect_corpus_findings(item, corpus_run):
-    """Check available mechanisms even when an unrelated mandatory model is absent.
+    """Check available mechanisms even when an unrelated mandatory adapter is absent.
 
     The separate verdict test skips when *any* mandatory adapter is absent, so
     it never presents partial detection as a complete clean verdict.
