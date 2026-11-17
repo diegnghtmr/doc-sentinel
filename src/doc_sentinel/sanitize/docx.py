@@ -547,23 +547,27 @@ _LINE_END_HYPHEN = re.compile(r"([-‐‑])[^\S\n]*\n")
 
 
 def _render_delta_ok(original: str, candidate: str, removed: list[str]) -> bool:
-    """Compare rendered character multisets with only bounded line-end hyphenation.
+    """True when the candidate render is the original render minus removed text only.
 
-    Whitespace and soft hyphens are ignored. Other added characters must be line-end
-    hyphens in the candidate; missing characters must be authorized removals or
-    line-end hyphens in the original. Unpainted removed text need not be present.
+    Line-end hyphenation is joined in both renders first ("instruc-" + newline +
+    "ciones" reads as "instrucciones"), so a hyphen that only marks a line break never
+    counts while every mid-line hyphen is an ordinary character. Whitespace and soft
+    hyphens are ignored. The candidate may not gain any character; each missing
+    character must be paid by a removed fragment that was actually painted in the
+    original render, so unpainted (e.g. w:vanish) removals authorize nothing.
     """
     from collections import Counter
 
-    def chars(text: str) -> Counter:
-        return Counter(c for c in text if not c.isspace() and c != "\u00ad")
+    def compact(text: str) -> str:
+        return "".join(c for c in _LINE_END_HYPHEN.sub("", text)
+                       if not c.isspace() and c != "\u00ad")
 
-    before, after = chars(original), chars(candidate)
-    before_line_ends = Counter(_LINE_END_HYPHEN.findall(original))
-    after_line_ends = Counter(_LINE_END_HYPHEN.findall(candidate))
-    if any(count > after_line_ends[char] for char, count in (after - before).items()):
+    before_text, after_text = compact(original), compact(candidate)
+    before, after = Counter(before_text), Counter(after_text)
+    if after - before:
         return False
-    budget = chars("".join(removed)) + before_line_ends
+    painted = [piece for piece in map(compact, removed) if piece and piece in before_text]
+    budget = Counter("".join(painted))
     return all(budget[char] >= count for char, count in (before - after).items())
 
 

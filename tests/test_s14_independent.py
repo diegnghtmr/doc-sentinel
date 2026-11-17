@@ -142,3 +142,28 @@ def test_s12_default_clean_retains_legacy_success_note(tmp_path):
     result = harness.run("clean", harness.input, "--json")
     expected = harness.input_dir / "informe final.cleaned.docx"
     assert (result.returncode, result.stdout, result.stderr) == (0, "", f"Cleaned copy: {expected}\n")
+
+
+# L58: a retained line-end hyphen or an unpainted removed fragment must not pay for a
+# visible hyphen that disappears or appears mid-line.
+@pytest.mark.parametrize("h", ["-", "‐", "‑"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_retained_line_end_cannot_pay_for_inline_change(h, reverse):
+    before, after = f"a{h}\nb a{h}b", f"a{h}\nb ab"
+    if reverse:
+        before, after = after, before
+    assert not impl._render_delta_ok(before, after, [])
+
+
+@pytest.mark.parametrize("h", ["-", "‐", "‑"])
+def test_unpainted_hidden_hyphen_cannot_pay_for_visible_loss(h):
+    assert not impl._render_delta_ok(f"a{h}b", "ab", [f"h{h}i"])
+
+
+def test_painted_hidden_fragment_with_hyphen_is_accepted_when_removed():
+    assert impl._render_delta_ok("Keep x-ray safe.", "Keep safe.", ["x-ray"])
+
+
+def test_hyphenation_moving_between_line_ends_is_accepted():
+    assert impl._render_delta_ok("instruc-\nciones visibles OCULTO", "instrucciones\nvisibles", ["OCULTO"])
+    assert impl._render_delta_ok("instrucciones\nvisibles OCULTO", "instruc-\nciones visibles", ["OCULTO"])
