@@ -107,12 +107,20 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
         fi
     fi
     if [ "$mode" = clean ] || [ "$sanitized" -eq 1 ]; then
+        if [ "$mode" = clean ] && [ -z "$output" ] && [ -z "$output_dir" ]; then
+            default_clean=1
+            case "$in_name" in
+                .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.cleaned" ;; *) out_name="${in_name%.*}.cleaned.${in_name##*.}" ;; esac ;;
+                *) out_name="$in_name.cleaned" ;;
+            esac
+            default_clean_path=$in_dir/$out_name
+            [ ! -L "$default_clean_path" ] || output=$default_clean_path
+        fi
         if [ -n "$output" ]; then
             output=$(resolve_path "$output") || fail 'output directory does not exist'
             same_path "$input" "$output" && fail 'output path must differ from the input (no in-place cleaning)'
             out_dir=$(dirname "$output"); out_name=$(basename "$output")
         else
-            if [ "$mode" = clean ] && [ -z "$output_dir" ]; then default_clean=1; fi
             [ -n "$output_dir" ] || output_dir=$in_dir
             [ -d "$output_dir" ] || fail 'output directory does not exist'
             out_dir=$(realpath "$output_dir") || fail 'output directory does not exist'
@@ -214,11 +222,7 @@ if [ "$mode" = clean ] && [ "$code" -eq 0 ]; then
     if [ -n "$output" ]; then
         printf 'Cleaned copy: %s\n' "$output" >&2
     elif [ "$default_clean" -eq 1 ]; then
-        case "$in_name" in
-            .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.cleaned" ;; *) out_name="${in_name%.*}.cleaned.${in_name##*.}" ;; esac ;;
-            *) out_name="$in_name.cleaned" ;;
-        esac
-        clean_path=$(resolve_path "$in_dir/$out_name") || clean_path=$in_dir/$out_name
+        clean_path=$(resolve_path "$default_clean_path") || clean_path=$default_clean_path
         printf 'Cleaned copy: %s\n' "$clean_path" >&2
     fi
 fi

@@ -144,16 +144,42 @@ class LauncherScenarios:
         assert harness.input.read_bytes() == b"synthetic input, unchanged"
         assert harness.run_args()[-3:] == ["/work/in/informe final.docx", "--output-dir", "/work/out"]
 
-    def test_clean_default_note_resolves_existing_output_symlink(self, harness):
-        target = harness.input_dir / "actual clean copy.docx"
+    @pytest.mark.parametrize("elsewhere,relative", [(False, True), (True, False), (True, True)])
+    def test_clean_default_output_symlink_uses_resolved_target(self, harness, elsewhere, relative):
+        directory = harness.output_dir if elsewhere else harness.input_dir
+        target = directory / "actual clean copy.docx"
         target.write_bytes(b"existing copy")
         alias = harness.input_dir / "informe final.cleaned.docx"
-        alias.symlink_to(target.name)
-        result = harness.run("clean", harness.input, "--force-output")
+        link = (Path("..") / directory.name / target.name if elsewhere else Path(target.name))
+        alias.symlink_to(link if relative else harness.path(target))
+        result = harness.run("clean", harness.input, "--force-output", "--agent-summary")
         assert (result.returncode, result.stdout, result.stderr) == (
             0, "", f"Cleaned copy: {harness.path(target)}\n")
+        run = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_OUTPUT={harness.path(target)}" in run
+        args = harness.assert_base(run, [
+            (harness.input_dir, "/work/in", "ro"), (directory, "/work/out", "rw")])
+        assert args == ["clean", "/work/in/informe final.docx", "-o", "/work/out/actual clean copy.docx",
+                        "--force-output", "--agent-summary"]
         assert harness.input.read_bytes() == b"synthetic input, unchanged"
-        assert harness.run_args()[-3:] == ["--output-dir", "/work/out", "--force-output"]
+        assert target.read_bytes() == b"existing copy" and alias.is_symlink()
+
+    @pytest.mark.parametrize("conflict", ["input", "report"])
+    def test_clean_default_output_symlink_refuses_protected_target(self, harness, conflict):
+        target = harness.input if conflict == "input" else harness.output_dir / "target.docx"
+        if conflict == "report":
+            target.write_bytes(b"existing copy")
+        before = target.read_bytes()
+        (harness.input_dir / "informe final.cleaned.docx").symlink_to(
+            target.name if conflict == "input" else Path("..") / harness.output_dir.name / target.name)
+        args = ["clean", harness.input, "--force-output"]
+        if conflict == "report":
+            args += ["--report", target]
+        result = harness.run(*args)
+        error = OUTPUT_ERROR if conflict == "input" else REPORT_CLEAN_ERROR
+        assert (result.returncode, result.stdout, result.stderr) == (2, "", error + "\n")
+        assert target.read_bytes() == before and harness.input.read_bytes() == b"synthetic input, unchanged"
+        assert harness.calls() == []
 
     def test_clean_custom_output_and_separate_report(self, harness):
         output = harness.output_dir / "clean copy.docx"

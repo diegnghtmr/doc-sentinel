@@ -616,7 +616,9 @@ def _sanitize_spans(src: Path, report: dict, plan: dict | None, review_root: Pat
                 from doc_sentinel.sanitize.docx import reviewed_mixed_spans
 
                 mixed = reviewed_mixed_spans(src, loc["pointer"], fragment.replace(MARKER, " "))
-                if mixed is not None:
+                if mixed is None:
+                    return [], hidden_ranges, "reviewed injection has no exact editable sentence"
+                if mixed is not NotImplemented:
                     spans.extend(mixed)
                     handled.append(source_finding)
                     continue

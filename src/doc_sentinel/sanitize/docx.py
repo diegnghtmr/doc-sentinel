@@ -356,8 +356,8 @@ def _streams(roots, entries, patches):
 def reviewed_mixed_spans(src: Path, pointer: str | None, fragment: str):
     """Bind a reviewed body excerpt to XML atoms before excluding structural edits.
 
-    Return None if it is not an unambiguous mixed/hidden excerpt; otherwise return
-    exact visible instruction sentences within the reviewed part of the excerpt.
+    Return NotImplemented for a non-mixed excerpt, None if mixed content cannot
+    be resolved safely, or the exact visible instruction sentences to remove.
     """
     from doc_sentinel.glue.instruction_phrases import instruction_spans
     from doc_sentinel.sanitize.pdf_to_docx import _normalized_positions
@@ -365,7 +365,7 @@ def reviewed_mixed_spans(src: Path, pointer: str | None, fragment: str):
     _infos, entries, _comment, _raw, _directory = read_package(src)
     roots = _raw_roots(entries)
     if pointer not in roots or not BODY.fullmatch(pointer):
-        return None
+        return NotImplemented
     structural = _structural(roots)
     atoms = [atom for node in roots[pointer].walk() if node.tag == W + "t"
              for atom in _node_atoms(node)]
@@ -378,15 +378,17 @@ def reviewed_mixed_spans(src: Path, pointer: str | None, fragment: str):
         matches.append(atoms[positions[start]:positions[start + len(wanted) - 1] + 1])
         start = normalized.find(wanted, start + 1)
     if not matches:
-        return None
+        return NotImplemented
     if len(matches) > 1:
         # A duplicate is safe only when every occurrence is entirely removed by
         # the structural hidden-content plan; never discard a visible twin.
-        return [] if all(all(_covered(pointer, atom, structural) for atom in match)
-                         for match in matches) else None
+        if all(all(_covered(pointer, atom, structural) for atom in match) for match in matches):
+            return []
+        return (None if any(_covered(pointer, atom, structural) for match in matches for atom in match)
+                else NotImplemented)
     selected = matches[0]
     if not any(_covered(pointer, atom, structural) for atom in selected):
-        return None
+        return NotImplemented
     selected_keys = {(atom.start, atom.end) for atom in selected}
     spans = []
     for stream in _streams(roots, entries, structural):
@@ -404,6 +406,9 @@ def reviewed_mixed_spans(src: Path, pointer: str | None, fragment: str):
             span = {"channel": "body", "pointer": pointer, "text": visible[begin:end]}
             if span not in spans:
                 spans.append(span)
+    if not spans and any(not atom.char.isspace() and not _covered(pointer, atom, structural)
+                         for atom in selected):
+        return None
     return spans
 
 

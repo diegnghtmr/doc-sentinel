@@ -269,6 +269,14 @@ function Invoke-Launcher([string[]]$Arguments) {
             }
         }
         if ($mode -eq 'clean' -or $sanitized) {
+            if ($mode -eq 'clean' -and -not $outputPath -and -not $outputDirOption) {
+                $extension = [IO.Path]::GetExtension($inName)
+                if (($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) -or $inName.EndsWith('.')) { $extension = '' }
+                $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
+                $defaultCleanOutput = Join-Path $inDir "$stem.cleaned$extension"
+                $defaultItem = Get-Item -LiteralPath $defaultCleanOutput -Force -ErrorAction SilentlyContinue
+                if ($defaultItem -and $defaultItem.LinkType) { $outputPath = $defaultCleanOutput }
+            }
             if ($outputPath) {
                 try { $outputPath = Resolve-HostPath $outputPath }
                 catch { Write-LauncherError 'output directory does not exist'; return 2 }
@@ -277,12 +285,6 @@ function Invoke-Launcher([string[]]$Arguments) {
                 }
                 $outDir = [IO.Path]::GetDirectoryName($outputPath); $outName = [IO.Path]::GetFileName($outputPath)
             } else {
-                if ($mode -eq 'clean' -and -not $outputDirOption) {
-                    $extension = [IO.Path]::GetExtension($inName)
-                    if (($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) -or $inName.EndsWith('.')) { $extension = '' }
-                    $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
-                    $defaultCleanOutput = Join-Path $inDir "$stem.cleaned$extension"
-                }
                 if (-not $outputDirOption) { $outputDirOption = $inDir }
                 try { $outDir = Resolve-HostPath $outputDirOption }
                 catch { Write-LauncherError 'output directory does not exist'; return 2 }
