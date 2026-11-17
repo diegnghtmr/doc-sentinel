@@ -36,7 +36,7 @@ case "$1" in
     *) fail "unknown command: $1" ;;
 esac
 
-input=''; output=''; output_dir=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''; sanitized=0
+input=''; output=''; output_dir=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''; sanitized=0; default_clean=0
 [ "$mode" != sanitize ] || sanitized=1
 if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$mode" = review-merge ]; then
     while [ "$#" -gt 0 ]; do
@@ -112,6 +112,7 @@ if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = sanitize ] || [ "$
             same_path "$input" "$output" && fail 'output path must differ from the input (no in-place cleaning)'
             out_dir=$(dirname "$output"); out_name=$(basename "$output")
         else
+            if [ "$mode" = clean ] && [ -z "$output_dir" ]; then default_clean=1; fi
             [ -n "$output_dir" ] || output_dir=$in_dir
             [ -d "$output_dir" ] || fail 'output directory does not exist'
             out_dir=$(realpath "$output_dir") || fail 'output directory does not exist'
@@ -209,5 +210,16 @@ set -- run --rm --network=none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g 
     --cap-drop=ALL --security-opt=no-new-privileges -e DOC_SENTINEL_NO_NETNS=1 "$@"
 docker "$@"
 code=$?
-if [ "$mode" = clean ] && [ "$code" -eq 0 ] && [ -n "$output" ]; then printf 'Cleaned copy: %s\n' "$output" >&2; fi
+if [ "$mode" = clean ] && [ "$code" -eq 0 ]; then
+    if [ -n "$output" ]; then
+        printf 'Cleaned copy: %s\n' "$output" >&2
+    elif [ "$default_clean" -eq 1 ]; then
+        case "$in_name" in
+            .*.*|?*.*) case "$in_name" in *.) out_name="$in_name.cleaned" ;; *) out_name="${in_name%.*}.cleaned.${in_name##*.}" ;; esac ;;
+            *) out_name="$in_name.cleaned" ;;
+        esac
+        clean_path=$(resolve_path "$in_dir/$out_name") || clean_path=$in_dir/$out_name
+        printf 'Cleaned copy: %s\n' "$clean_path" >&2
+    fi
+fi
 exit "$code"

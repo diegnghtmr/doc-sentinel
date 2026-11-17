@@ -112,11 +112,48 @@ def harness():
 class LauncherScenarios:
     def test_clean_default_output_and_paths_with_spaces(self, harness):
         result = harness.run("clean", harness.input, "--json")
-        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        expected = harness.input_dir / "informe final.cleaned.docx"
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "", f"Cleaned copy: {harness.path(expected)}\n")
         args = harness.assert_base(harness.run_args(), [
             (harness.input_dir, "/work/in", "ro"), (harness.input_dir, "/work/out", "rw")])
         assert args == ["clean", "/work/in/informe final.docx", "--output-dir", "/work/out", "--json"]
         assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    @pytest.mark.parametrize("name", [
+        "quarterly.report.v1.docx", ".hidden", ".hidden.txt", "..hidden", "name..txt", "trailing.", "noext",
+    ])
+    def test_clean_default_note_uses_cli_default_name(self, harness, name):
+        src = harness.input_dir / name
+        src.write_bytes(b"synthetic input, unchanged")
+        expected = harness.input_dir / f"{src.stem}.cleaned{src.suffix}"
+        harness.config.update(FAKE_RUN_STDOUT="output\n", FAKE_RUN_STDERR="detail\n")
+        result = harness.run("clean", src)
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "output\n", f"detail\nCleaned copy: {harness.path(expected)}\n")
+        assert src.read_bytes() == b"synthetic input, unchanged"
+        assert harness.run_args()[-2:] == ["--output-dir", "/work/out"]
+
+    def test_clean_default_note_uses_resolved_input_name(self, harness):
+        alias = harness.input_dir / "alias.txt"
+        alias.symlink_to(harness.input.name)
+        expected = harness.input_dir / "informe final.cleaned.docx"
+        result = harness.run("clean", alias)
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "", f"Cleaned copy: {harness.path(expected)}\n")
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+        assert harness.run_args()[-3:] == ["/work/in/informe final.docx", "--output-dir", "/work/out"]
+
+    def test_clean_default_note_resolves_existing_output_symlink(self, harness):
+        target = harness.input_dir / "actual clean copy.docx"
+        target.write_bytes(b"existing copy")
+        alias = harness.input_dir / "informe final.cleaned.docx"
+        alias.symlink_to(target.name)
+        result = harness.run("clean", harness.input, "--force-output")
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "", f"Cleaned copy: {harness.path(target)}\n")
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+        assert harness.run_args()[-3:] == ["--output-dir", "/work/out", "--force-output"]
 
     def test_clean_custom_output_and_separate_report(self, harness):
         output = harness.output_dir / "clean copy.docx"

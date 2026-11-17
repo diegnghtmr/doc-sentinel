@@ -642,8 +642,59 @@ def test_render_delta_refuses_added_character():
 
 def test_render_delta_ignores_line_end_hyphenation():
     original = "instrucciones visibles OCULTO"
-    candidate = "instruc- ciones visibles"
+    candidate = "instruc-\nciones visibles"
     assert _render_delta_ok(original, candidate, ["OCULTO"])
+
+
+@pytest.mark.parametrize("hyphen", ["-", "\u2010", "\u2011"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_render_delta_only_ignores_line_end_hyphens(hyphen, reverse):
+    unbroken = "Keep ab safe."
+    inline = f"Keep a{hyphen}b safe."
+    line_end = f"Keep a{hyphen}  \nb safe."
+    assert not _render_delta_ok(*(inline, unbroken) if reverse else (unbroken, inline), [])
+    assert _render_delta_ok(*(line_end, unbroken) if reverse else (unbroken, line_end), [])
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_render_delta_line_end_budget_does_not_hide_inline_hyphen(reverse):
+    with_hyphens = "First a-\nb; second a-b."
+    without = "First ab; second ab."
+    assert not _render_delta_ok(*(with_hyphens, without) if reverse else (without, with_hyphens), [])
+
+
+def test_render_delta_counts_authorized_hyphen_removals_and_soft_hyphens():
+    assert _render_delta_ok("Keep a-b; remove h-i.", "Keep a-b;", ["remove h-i."])
+    assert not _render_delta_ok("Keep a-b; remove h-i.", "Keep ab;", ["remove h-i."])
+    assert _render_delta_ok("in\u00advisible", "invisible", [])
+    assert _render_delta_ok("invisible", "in\u00advisible", [])
+
+
+def test_render_equal_retains_line_end_hyphenation(workspace, monkeypatch):
+    from doc_sentinel.sanitize import docx as impl
+    from doc_sentinel.sanitize import pdf_to_docx
+
+    original = Document()
+    original.add_paragraph("instruc-\nciones visibles")
+    candidate = Document()
+    candidate.add_paragraph("instrucciones visibles")
+    before = workspace / "before.docx"
+    after = workspace / "after.docx"
+    original.save(before)
+    candidate.save(after)
+    seen = []
+    delta = impl._render_delta_ok
+
+    def capture(expected, actual, removed):
+        seen.append((expected, actual))
+        return delta(expected, actual, removed)
+
+    monkeypatch.setattr(impl, "_render_delta_ok", capture)
+    monkeypatch.setattr(pdf_to_docx, "_similarity", lambda *_args: {
+        "pages": [{"page": 1, "similarity": 1.0}], "source_pages": 1, "output_pages": 1})
+    comparison = impl.render_equal(before, after, [], workspace)
+    assert comparison[0] is True and comparison[3] == "equivalent_with_reflow"
+    assert len(seen) == 1 and "instruc-\nciones" in seen[0][0]
 
 
 def test_render_delta_allows_hidden_text_that_was_never_rendered():
@@ -888,6 +939,47 @@ def test_locate_still_refuses_non_space_whitespace_and_style_changes():
     assert _locate_widths(chars, "ab\tcd", TINY, {"size": 4}) is None
     mixed = _glyphs("ab ") + _glyphs("cd", x=12.0, font="G")
     assert _locate_widths(mixed, "ab cd", TINY, {"size": 4}) is None
+
+
+@pytest.mark.parametrize("rendered,source", [
+    ("ab cd", "a bcd"), ("abcd", "ab cd"), ("ab cd", "abcd"),
+    ("ab  cd", "ab cd"), ("ab cd", "ab  cd"),
+])
+def test_locate_refuses_missing_extra_or_moved_internal_spaces(rendered, source):
+    from doc_sentinel.sanitize.docx import _locate_widths
+
+    chars = _glyphs(rendered) + _glyphs("x y", line=(0, 1, 0))
+    assert _locate_widths(chars, source, TINY, {"size": 4}) is None
+
+
+def test_locate_only_omits_source_space_at_rendered_line_boundary():
+    from doc_sentinel.sanitize.docx import _locate_widths
+
+    chars = (_glyphs("ab", line=(0, 0, 0)) + _glyphs("cd", line=(0, 0, 1)) +
+             _glyphs("x y", line=(0, 1, 0)))
+    located = _locate_widths(chars, "ab cd", TINY, {"size": 4})
+    assert located is not None and len(located[0]) == 2 and located[1] == 4
+    chars_with_extra = (_glyphs("ab ", line=(0, 0, 0)) +
+                        _glyphs("cd", line=(0, 0, 1)))
+    assert _locate_widths(chars_with_extra, "abcd", TINY, {"size": 4}) is None
+
+
+def test_locate_unique_match_obeys_cursor():
+    from doc_sentinel.sanitize.docx import _locate_widths
+
+    chars = _glyphs("xy ab cd")
+    assert _locate_widths(chars, "ab cd", TINY, {"size": 4}, 3) is None
+    located = _locate_widths(chars, "ab cd", TINY, {"size": 4}, 2)
+    assert located is not None and located[1] == 6
+
+
+def test_locate_whitespace_only_rejects_multiple_space_fonts():
+    from doc_sentinel.sanitize.docx import _locate_widths
+
+    one_space_font = _glyphs("a b") + _glyphs("cd", font="G")
+    assert _locate_widths(one_space_font, "  ", TINY, {"size": 4})[0] == [(1.0, 10)]
+    mixed_space_fonts = _glyphs("a b") + _glyphs("c d", font="G")
+    assert _locate_widths(mixed_space_fonts, "  ", TINY, {"size": 4}) is None
 
 
 def test_repeated_and_padded_tiny_hidden_runs_all_keep_their_space(workspace):

@@ -543,28 +543,28 @@ def _actions(patches):
             for p in patches if p.record]
 
 
-_HYPHENS = frozenset("-­‐‑")
+_LINE_END_HYPHEN = re.compile(r"([-‐‑])[^\S\n]*\n")
 
 
 def _render_delta_ok(original: str, candidate: str, removed: list[str]) -> bool:
-    """True when the candidate's rendered text is the original's minus removed text only.
+    """Compare rendered character multisets with only bounded line-end hyphenation.
 
-    Compared as character multisets (whitespace and hyphens ignored) so reflow, block
-    order and line-end hyphenation in the PDF text layer cannot cause a false refusal:
-    the candidate may not contain any character the original render lacks, and every
-    character missing from it must be accounted for by the removed fragments. Text that
-    LibreOffice never painted (e.g. w:vanish) is simply absent from both renders.
+    Whitespace and soft hyphens are ignored. Other added characters must be line-end
+    hyphens in the candidate; missing characters must be authorized removals or
+    line-end hyphens in the original. Unpainted removed text need not be present.
     """
     from collections import Counter
 
     def chars(text: str) -> Counter:
-        return Counter(c for c in text if not c.isspace() and c not in _HYPHENS)
+        return Counter(c for c in text if not c.isspace() and c != "\u00ad")
 
     before, after = chars(original), chars(candidate)
-    if after - before:
+    before_line_ends = Counter(_LINE_END_HYPHEN.findall(original))
+    after_line_ends = Counter(_LINE_END_HYPHEN.findall(candidate))
+    if any(count > after_line_ends[char] for char, count in (after - before).items()):
         return False
-    budget = chars("".join(removed))
-    return all(budget[c] >= n for c, n in (before - after).items())
+    budget = chars("".join(removed)) + before_line_ends
+    return all(budget[char] >= count for char, count in (before - after).items())
 
 
 def _render_pdf(path: Path, root: Path, index: int) -> Path:
@@ -611,11 +611,11 @@ def _median_space(chars) -> float | None:
 def _locate_widths(chars, text: str, reason: str, props: dict[str, Any], cursor: int = 0):
     """Measure a hidden run on the original render: ([(width_pt, spacing_twips)], cursor).
 
-    Complete non-space text is matched in render order. A unique match is used as is;
-    repeated text takes the first occurrence at or after ``cursor`` (runs are measured in
-    document order). Padding spaces add one space width each; only normal spaces may
-    be omitted at a rendered line boundary. Anything else fails closed (None) and the
-    run falls back to plain removal, leaving the render gate to decide.
+    Complete non-space text is matched in render order at or after ``cursor``;
+    repeated text takes the first such occurrence (runs are measured in document order).
+    Padding spaces add one space width each; only normal spaces may be omitted at a
+    rendered line boundary. Anything else fails closed (None) and the run falls back to
+    plain removal, leaving the render gate to decide.
     """
     if not text or any(c.isspace() and c != " " for c in text):
         return None
@@ -627,6 +627,8 @@ def _locate_widths(chars, text: str, reason: str, props: dict[str, Any], cursor:
     if not core:
         size = props.get("size")
         same = [c for c in eligible if size is not None and abs(c[3] - size / 2) < 0.05]
+        if len({c[5] for c in same if c[0] == " "}) > 1:
+            return None
         space_width = _median_space(same)
         if space_width is None:
             return None
@@ -641,9 +643,21 @@ def _locate_widths(chars, text: str, reason: str, props: dict[str, Any], cursor:
         return None
     if rendered.find(wanted, start + 1) >= 0:
         start = rendered.find(wanted, cursor)
-        if start < 0:
-            return None
+    if start < cursor:
+        return None
     selected = eligible[nonspace[start]:nonspace[start + len(wanted) - 1] + 1]
+    glyph_index = 0
+    for char in core:
+        if glyph_index < len(selected) and char == selected[glyph_index][0]:
+            glyph_index += 1
+        elif (char == " " and 0 < glyph_index < len(selected)
+              and selected[glyph_index - 1][1] != selected[glyph_index][1]):
+            # LibreOffice can omit a source space at the wrap between these glyphs.
+            continue
+        else:
+            return None
+    if glyph_index != len(selected):
+        return None
     style = {(round(c[3], 2), c[4], c[5]) for c in selected}
     if len({c[1][0] for c in selected}) != 1 or len(style) != 1:
         return None
@@ -825,8 +839,10 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
             from doc_sentinel.sanitize.pdf_to_docx import _similarity
 
             with pymupdf.open(pdfs[-2]) as expected, pymupdf.open(pdfs[-1]) as after:
-                expected_text = _normalized(" ".join(page.get_text() for page in expected))
-                actual_text = _normalized(" ".join(page.get_text() for page in after))
+                expected_text = "\n".join(_normalized(line) for page in expected
+                                          for line in page.get_text().splitlines())
+                actual_text = "\n".join(_normalized(line) for page in after
+                                        for line in page.get_text().splitlines())
             if not _render_delta_ok(expected_text, actual_text, list(hidden or [])):
                 return False, regions, "rendered visible text changed"
             metric = _similarity(pdfs[-2], pdfs[-1])

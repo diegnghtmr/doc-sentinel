@@ -188,7 +188,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         Write-LauncherError "unknown command: $mode"; return 2
     }
     $inputPath = ''; $outputPath = ''; $outputDirOption = ''; $reportPath = ''; $reviewPath = ''; $json = $false; $agent = $false
-    $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @(); $sanitized = $mode -eq 'sanitize'
+    $defaultCleanOutput = ''; $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @(); $sanitized = $mode -eq 'sanitize'
     if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'sanitize' -or $mode -eq 'review-merge') {
         while ($index -lt $Arguments.Count) {
             $arg = $Arguments[$index]; $index++
@@ -277,6 +277,12 @@ function Invoke-Launcher([string[]]$Arguments) {
                 }
                 $outDir = [IO.Path]::GetDirectoryName($outputPath); $outName = [IO.Path]::GetFileName($outputPath)
             } else {
+                if ($mode -eq 'clean' -and -not $outputDirOption) {
+                    $extension = [IO.Path]::GetExtension($inName)
+                    if (($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) -or $inName.EndsWith('.')) { $extension = '' }
+                    $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
+                    $defaultCleanOutput = Join-Path $inDir "$stem.cleaned$extension"
+                }
                 if (-not $outputDirOption) { $outputDirOption = $inDir }
                 try { $outDir = Resolve-HostPath $outputDirOption }
                 catch { Write-LauncherError 'output directory does not exist'; return 2 }
@@ -349,7 +355,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         -ReviewDirectory $reviewPath -DisplayEnvironment $displayEnvironment -ContainerArguments $containerArgs)
     # Invoke the native process at script scope, not in a captured function pipeline.
     # This keeps its stdout/stderr connected to the caller instead of capturing its output.
-    $script:RunSpec = @{ Docker = $docker; Arguments = $runArgs; Mode = $mode; Output = $outputPath }
+    $script:RunSpec = @{ Docker = $docker; Arguments = $runArgs; Mode = $mode; Output = $outputPath; DefaultCleanOutput = $defaultCleanOutput }
     return 0
 }
 
@@ -360,7 +366,12 @@ $docker = $script:RunSpec.Docker
 $runArgs = $script:RunSpec.Arguments
 & $docker @runArgs
 $code = $LASTEXITCODE
-if ($script:RunSpec.Mode -eq 'clean' -and $code -eq 0 -and $script:RunSpec.Output) {
-    [Console]::Error.WriteLine("Cleaned copy: $($script:RunSpec.Output)")
+if ($script:RunSpec.Mode -eq 'clean' -and $code -eq 0) {
+    $cleanOutput = $script:RunSpec.Output
+    if (-not $cleanOutput -and $script:RunSpec.DefaultCleanOutput) {
+        try { $cleanOutput = Resolve-HostPath $script:RunSpec.DefaultCleanOutput }
+        catch { $cleanOutput = $script:RunSpec.DefaultCleanOutput }
+    }
+    if ($cleanOutput) { [Console]::Error.WriteLine("Cleaned copy: $cleanOutput") }
 }
 exit $code
