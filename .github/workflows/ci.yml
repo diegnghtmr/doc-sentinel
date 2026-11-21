@@ -52,6 +52,8 @@ jobs:
         with:
           toolchain: "1.88"
       - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa qpdf poppler-utils
+      - name: Allow unprivileged user namespaces (detect sandbox uses unshare -rn)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: |
           pip install uv
           uv pip install --system --index-strategy unsafe-best-match \
@@ -73,7 +75,20 @@ jobs:
           submodules: recursive
       - run: docker build -f containers/Dockerfile.detect -t doc-sentinel-detect .
       - name: detect runs with --network=none
+        # Prompt Guard weights are not in the image, so the verdict cannot be "clean" here;
+        # assert the run completed, the Unicode layer ran and the zero-width char was found.
         run: |
           mkdir -p work && printf 'hola\xe2\x80\x8bmundo\n' > work/z.txt
+          set +e
           docker run --rm --network=none -e DOC_SENTINEL_NO_NETNS=1 \
-            -v "$PWD/work:/work/in:ro" doc-sentinel-detect detect /work/in/z.txt --json || test $? -le 2
+            -v "$PWD/work:/work/in:ro" doc-sentinel-detect detect /work/in/z.txt --json > out.json
+          code=$?
+          set -e
+          python3 - "$code" <<'PY'
+          import json, sys
+          d = json.load(open("out.json"))
+          assert d["verdict"] != "clean", d["verdict"]
+          assert "unicode-smuggling-guard" in d["adapters_run"], d["adapters_run"]
+          assert any(f["class"] == "unicode_smuggling" for f in d["findings"]), d["findings"]
+          print("exit", sys.argv[1], "verdict", d["verdict"])
+          PY

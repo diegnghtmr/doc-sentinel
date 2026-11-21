@@ -13,7 +13,13 @@ from doc_sentinel.adapters.base import RunContext
 from doc_sentinel.aggregate import aggregate_detect, decide_clean
 from doc_sentinel.extract import extract_channels
 from doc_sentinel.formats import detect_type
-from doc_sentinel.report import new_report, sha256_file
+from doc_sentinel.report import (
+    atomic_write_bytes,
+    new_report,
+    pin_target,
+    same_file,
+    sha256_file,
+)
 from doc_sentinel.schema import AdapterOutcome, Channel, Finding
 
 
@@ -89,8 +95,14 @@ def run_detect(src: Path, *, allow_network: bool = False, fail_on: str = "high",
         try:
             ctx.channels = extract_channels(src, dtype) + _hidden_channels(revealed)
         except Exception as exc:  # noqa: BLE001
-            report["warnings"].append(f"channel extraction failed: {type(exc).__name__}: {exc}")
-            ctx.channels = [Channel("filename", src.name, pointer="filename")]
+            # The channel layer then only sees the filename and revealed text: record the
+            # extraction as a failed mandatory step so the verdict can never be "clean".
+            reason = f"{type(exc).__name__}: {exc}"[:500]
+            report["warnings"].append(f"channel extraction failed: {reason}")
+            outcomes.append(AdapterOutcome("channel-extract", "error", reason=reason))
+            mandatory = mandatory | {"channel-extract"}
+            ctx.channels = [Channel("filename", src.name, pointer="filename"),
+                            *_hidden_channels(revealed)]
         for adapter in channel_layer:
             outcomes.append(_run_inspect(adapter, src, ctx))
 
@@ -114,12 +126,14 @@ def run_clean(src: Path, *, output: Path | None = None, force_output: bool = Fal
               timeout_s: float = 300.0) -> tuple[dict[str, Any], int]:
     src = _check_input(src)
     dest = (output or default_output(src)).resolve()
-    if dest == src:
+    if dest == src or same_file(dest, src):
         raise UsageError("output path must differ from the input (no in-place cleaning)")
-    if report_path is not None and report_path.resolve() in (src, dest):
+    if report_path is not None and (same_file(report_path, src)
+                                    or same_file(report_path, dest)):
         raise UsageError("report path must differ from the input and the output document")
     if dest.exists() and not force_output:
         raise UsageError(f"output exists: {dest} (use --force-output to replace it)")
+    target = pin_target(dest, protect=[src])
     dtype = detect_type(src)
     chain = registry.clean_chain(dtype)
     if not chain:
@@ -161,8 +175,7 @@ def run_clean(src: Path, *, output: Path | None = None, force_output: bool = Fal
                                           if a.get("c2pa")]
             current = out
         if not tool_failed:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(current, dest)
+            atomic_write_bytes(target, current.read_bytes())
             report["output_path"] = str(dest)
 
     if sha256_file(src) != original_sha:

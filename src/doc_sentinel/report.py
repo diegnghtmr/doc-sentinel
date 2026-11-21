@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import secrets
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -119,9 +123,128 @@ def to_human_summary(report: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def write_report(report: dict[str, Any], path: Path) -> None:
-    if path.suffix.lower() in (".md", ".markdown"):
-        path.write_text(to_markdown(report), encoding="utf-8")
+def same_file(a: Path, b: Path) -> bool:
+    """True when both paths name the same file, including symlink and hardlink aliases."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return a.resolve() == b.resolve()
+
+
+class UnsafePathError(OSError):
+    """A write target resolves to a protected file or its directory changed under us."""
+
+
+Identity = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PinnedTarget:
+    """A write destination validated once, before any untrusted work runs.
+
+    ``parent`` is the already-resolved directory and ``parent_id`` its (st_dev, st_ino) at
+    validation time; ``protected`` / ``protected_entries`` identify files that must never be
+    replaced (the input document, the cleaned copy), also captured at validation time so a
+    later rename of their directory cannot make the check forget them.
+    """
+
+    path: Path
+    parent: Path
+    parent_id: Identity
+    name: str
+    protected: frozenset[Identity]
+    protected_entries: frozenset[tuple[Identity, str]]
+
+
+def _identity(path: Path) -> Identity | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def pin_target(path: Path, protect: Sequence[Path] = ()) -> PinnedTarget:
+    """Validate a destination: create its directory, resolve it once and record identities."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.resolve()
+    parent_id = _identity(parent)
+    if parent_id is None:
+        raise UnsafePathError(f"cannot stat output directory: {parent}")
+    protected = frozenset(i for i in (_identity(p) for p in protect) if i is not None)
+    entries = set()
+    for item in protect:
+        item_parent = _identity(item.parent)
+        if item_parent is not None:
+            entries.add((item_parent, item.name))
+    return PinnedTarget(path, parent, parent_id, path.name, protected, frozenset(entries))
+
+
+def _open_pinned_dir(target: PinnedTarget) -> int:
+    """Open the validated directory walking its stored resolved components with O_NOFOLLOW.
+
+    No re-resolution happens here: a component swapped for a symlink fails to open, and a
+    directory swapped for another real directory fails the identity check.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for part in target.parent.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                raise UnsafePathError(f"output directory changed after validation "
+                                      f"({part!r}: {exc.strerror})") from exc
+            os.close(fd)
+            fd = child
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != target.parent_id:
+            raise UnsafePathError(f"output directory changed after validation: {target.parent}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def atomic_write_bytes(target: PinnedTarget, data: bytes) -> None:
+    """Write ``data`` as a private (0600) file via temp file + rename in the pinned directory.
+
+    An existing entry is replaced as a directory entry, never written through its inode, and
+    the write is refused when the entry is one of the protected files.
+    """
+    dir_fd = _open_pinned_dir(target)
+    name = target.name
+    tmp = f".{name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    try:
+        if (target.parent_id, name) in target.protected_entries:
+            raise UnsafePathError(f"refusing to replace a protected file: {target.path}")
+        try:
+            current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (current.st_dev, current.st_ino) in target.protected:
+            raise UnsafePathError(f"refusing to replace a protected file: {target.path}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
+
+
+def write_report(report: dict[str, Any], target: PinnedTarget) -> None:
+    if target.path.suffix.lower() in (".md", ".markdown"):
+        text = to_markdown(report)
     else:
-        path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-                        encoding="utf-8")
+        text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_bytes(target, text.encode("utf-8"))

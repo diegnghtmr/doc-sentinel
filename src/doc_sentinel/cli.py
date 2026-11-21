@@ -14,8 +14,15 @@ from doc_sentinel import __version__
 from doc_sentinel.adapters.base import repo_root
 from doc_sentinel.intents import classify
 from doc_sentinel.pins import checkout_sha, load_lock
-from doc_sentinel.pipeline import UsageError, run_clean, run_detect
-from doc_sentinel.report import to_human_summary, write_report
+from doc_sentinel.pipeline import UsageError, default_output, run_clean, run_detect
+from doc_sentinel.report import (
+    PinnedTarget,
+    UnsafePathError,
+    pin_target,
+    same_file,
+    to_human_summary,
+    write_report,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -58,9 +65,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _emit(report: dict, args: argparse.Namespace) -> None:
-    if args.report:
-        write_report(report, args.report)
+def _pin_report(args: argparse.Namespace) -> PinnedTarget | None:
+    """Validate --report before any untrusted work runs (see report.PinnedTarget)."""
+    if not args.report:
+        return None
+    protect = [args.file]
+    if args.command == "clean":
+        protect.append(args.output or default_output(args.file))
+    what = ("the input and the output document" if args.command == "clean"
+            else "the input document")
+    for item in protect:
+        if same_file(args.report, item):
+            raise UsageError(f"report path must differ from {what}")
+    return pin_target(args.report, protect=protect)
+
+
+def _emit(report: dict, args: argparse.Namespace, report_target: PinnedTarget | None) -> None:
+    if report_target is not None:
+        write_report(report, report_target)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         print(to_human_summary(report), file=sys.stderr)
@@ -96,16 +118,20 @@ def main(argv: list[str] | None = None) -> int:
             print(mode)
             return 0
         if args.command == "detect":
-            if args.report and args.report.resolve() == args.file.resolve():
-                raise UsageError("report path must differ from the input document")
+            if not args.file.is_file():
+                raise UsageError(f"input not found: {args.file}")
+            report_target = _pin_report(args)
             report, code = run_detect(args.file, allow_network=args.allow_network,
                                       fail_on=args.fail_on)
-            _emit(report, args)
+            _emit(report, args, report_target)
             return code
         if args.command == "clean":
+            if not args.file.is_file():
+                raise UsageError(f"input not found: {args.file}")
+            report_target = _pin_report(args)
             report, code = run_clean(args.file, output=args.output,
                                      force_output=args.force_output, report_path=args.report)
-            _emit(report, args)
+            _emit(report, args, report_target)
             return code
         if args.command == "update":
             from doc_sentinel.update import run_update
@@ -117,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
                 for item in result.get("pins", []):
                     print(f"{item['id']}: {item['status']}")
             return code
+    except UnsafePathError as exc:
+        print(f"doc-sentinel: unsafe write refused: {exc}", file=sys.stderr)
+        return 2
     except UsageError as exc:
         print(f"doc-sentinel: {exc}", file=sys.stderr)
         return 2
