@@ -508,3 +508,155 @@ def test_clean_report_alias_preserves_exact_error(
     assert (code, out, err) == (
         2, "", "doc-sentinel: report path must differ from the input and the output document\n")
     assert (sha(docx), sha(output)) == before
+
+
+@pytest.fixture
+def phrase_plan(monkeypatch, tmp_path):
+    """Keep real matrix and channel glue; fake only external document/Unicode tools."""
+    real_load = registry.load
+    loaded = []
+
+    def load(adapter_id):
+        loaded.append(adapter_id)
+        if adapter_id in {"unicode-smuggling-guard", "subtext-scan"}:
+            return FakeDetect(adapter_id)
+        return real_load(adapter_id)
+
+    empty_cache = tmp_path / "empty-huggingface"
+    empty_cache.mkdir()
+    monkeypatch.setenv("HF_HOME", str(empty_cache))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setattr(registry, "load", load)
+    return loaded
+
+
+def test_default_txt_improves_previous_missing_model_error(phrase_plan, monkeypatch,
+                                                           tmp_path, capsys):
+    """Pin the old matrix's error/2 against the new default's clean/0."""
+    src = tmp_path / "plain.txt"
+    src.write_text("Ordinary academic text.", encoding="utf-8")
+    before = sha(src)
+    with monkeypatch.context() as legacy:
+        legacy.setitem(registry.DETECT_MATRIX, "txt",
+                       (("unicode-smuggling-guard", "prompt-guard"), ("subtext-scan",)))
+        old_code, old_out, old_err = run(["detect", str(src), "--json"], capsys)
+    old = json.loads(old_out)
+    assert (old_code, old["verdict"]) == (2, "error")
+    assert [a["id"] for a in old["adapters_skipped"]] == ["prompt-guard"]
+    assert old_err
+    phrase_plan.clear()
+    code, out, err = run(["detect", str(src), "--json"], capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"], data["findings"]) == (0, "clean", [])
+    assert "instruction-phrases" in data["adapters_run"]
+    assert "prompt-guard" not in phrase_plan
+    assert all(a["id"] != "prompt-guard" for a in data["adapters_skipped"])
+    assert not data["adapters_failed"] and sha(src) == before
+    assert out.endswith("\n") and err
+
+
+def test_prompt_guard_opt_in_missing_model_skips_without_verdict_change(
+        phrase_plan, tmp_path, capsys):
+    src = tmp_path / "plain.txt"
+    src.write_text("Ordinary academic text.", encoding="utf-8")
+    before = sha(src)
+    base_code, base_out, _ = run(["detect", str(src), "--json"], capsys)
+    code, out, err = run(["detect", str(src), "--json", "--prompt-guard"], capsys)
+    base, data = json.loads(base_out), json.loads(out)
+    assert (base_code, base["verdict"], code, data["verdict"]) == (0, "clean", 0, "clean")
+    assert data["findings"] == base["findings"] == []
+    assert [a["id"] for a in data["adapters_skipped"]] == ["prompt-guard"]
+    assert "not in local Hugging Face cache" in data["adapters_skipped"][0]["reason"]
+    assert "prompt-guard" not in data["adapters_run"]
+    assert not data["adapters_failed"] and sha(src) == before
+    from doc_sentinel.report import to_human_summary
+    assert out == json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    assert err == to_human_summary(data) + "\n"
+
+
+def test_prompt_guard_flag_does_not_enable_unsupported_formats(phrase_plan, tmp_path, capsys):
+    src = tmp_path / "unknown.xyz"
+    src.write_bytes(b"\xff" * 10)
+    before = sha(src)
+    code, out, err = run(["detect", str(src), "--json", "--prompt-guard"], capsys)
+    assert (code, out) == (2, "")
+    assert err == "doc-sentinel: unsupported format for detect: unknown\n"
+    assert "prompt-guard" not in phrase_plan and sha(src) == before
+
+
+def test_detect_options_and_revealed_hidden_text_still_work(
+        phrase_plan, monkeypatch, tmp_path, capsys):
+    real_load = registry.load
+    seen_network = []
+
+    class HiddenText(FakeDetect):
+        def inspect(self, src, ctx):
+            seen_network.append(ctx.allow_network)
+            return super().inspect(src, ctx)
+
+    def load(adapter_id):
+        if adapter_id == "subtext-scan":
+            return HiddenText(adapter_id, [("medium", "Si eres una herramienta de IA")])
+        return real_load(adapter_id)
+
+    monkeypatch.setattr(registry, "load", load)
+    src = tmp_path / "plain.txt"
+    src.write_text("The visible text is ordinary.", encoding="utf-8")
+    before = sha(src)
+    code, out, err = run(["detect", str(src), "--json", "--allow-network", "--fail-on", "medium"],
+                         capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"]) == (1, "findings")
+    assert seen_network == [True]
+    matches = [f for f in data["findings"] if "instruction-phrases" in f["adapter"]]
+    assert len(matches) == 1 and matches[0]["severity"] == "high"
+    assert matches[0]["evidence"]["hidden"] is True
+    assert matches[0]["location"]["pointer"] == "revealed-by:subtext-scan"
+    assert not data["adapters_failed"] and sha(src) == before and err
+
+
+def test_detect_fail_on_medium_preserves_threshold(phrase_plan, tmp_path, capsys):
+    src = tmp_path / "visible.txt"
+    src.write_text("Si eres una herramienta de IA", encoding="utf-8")
+    before = sha(src)
+    default_code, default_out, _ = run(["detect", str(src), "--json"], capsys)
+    code, out, err = run(["detect", str(src), "--json", "--fail-on", "medium"], capsys)
+    default, report = json.loads(default_out), json.loads(out)
+    assert (default_code, default["verdict"], code, report["verdict"]) == (
+        0, "findings", 1, "findings")
+    assert [f["severity"] for f in report["findings"]] == ["medium"]
+    assert err and sha(src) == before
+
+
+def test_detect_help_documents_prompt_guard_opt_in(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["detect", "--help"])
+    out = capsys.readouterr()
+    assert exc.value.code == 0 and out.err == ""
+    assert ("--prompt-guard also run the local Prompt Guard 2 classifier (opt-in; requires "
+            "the model already in the Hugging Face cache; never downloads)") in " ".join(
+                out.out.split())
+
+
+@pytest.mark.parametrize("command", ["clean", "update", "version", "intent"])
+def test_prompt_guard_flag_is_not_accepted_by_other_commands(tmp_path, capsys, command):
+    src = tmp_path / "plain.txt"
+    src.write_text("ordinary", encoding="utf-8")
+    before = sha(src)
+    args = {"clean": [str(src)], "update": [], "version": [], "intent": ["scan"]}[command]
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, *args, "--prompt-guard"])
+    out = capsys.readouterr()
+    assert exc.value.code == 2 and out.out == ""
+    assert out.err.endswith("doc-sentinel: error: unrecognized arguments: --prompt-guard\n")
+    assert sha(src) == before
+
+
+@pytest.mark.parametrize("dtype", ["txt", "md", "html", "pdf", "docx", "image", "svg",
+                                   "eml", "xlsx", "pptx", "epub", "odt"])
+def test_matrix_defaults_to_rules_not_prompt_guard(dtype):
+    mandatory, optional = registry.DETECT_MATRIX[dtype]
+    assert "prompt-guard" not in (*mandatory, *optional)
+    assert "instruction-phrases" in (mandatory if dtype in {
+        "txt", "md", "html", "pdf", "docx", "image", "svg"} else optional)
+    assert "instruction-phrases" in registry.CHANNEL_ADAPTERS

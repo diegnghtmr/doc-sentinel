@@ -49,6 +49,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="write the report to PATH (.md = Markdown, otherwise JSON)")
     detect.add_argument("--allow-network", action="store_true",
                         help="allow sub-harnesses to use the network (off by default)")
+    detect.add_argument("--prompt-guard", action="store_true",
+                        help="also run the local Prompt Guard 2 classifier (opt-in; requires "
+                             "the model already in the Hugging Face cache; never downloads)")
     detect.add_argument("--fail-on", choices=("high", "medium"), default="high",
                         help="lowest severity that makes the exit code 1 (default: high)")
 
@@ -122,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise UsageError(f"input not found: {args.file}")
             report_target = _pin_report(args)
             report, code = run_detect(args.file, allow_network=args.allow_network,
-                                      fail_on=args.fail_on)
+                                      fail_on=args.fail_on, prompt_guard=args.prompt_guard)
             _emit(report, args, report_target)
             return code
         if args.command == "clean":

@@ -6,8 +6,10 @@ import json
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from doc_sentinel.adapters.base import (
     AdapterError,
@@ -18,6 +20,78 @@ from doc_sentinel.adapters.base import (
     third_party,
 )
 from doc_sentinel.schema import Finding, Location
+
+# The upstream product list is part of a standalone script, not an importable
+# package. This bounded vocabulary covers AI names in document metadata values.
+_PDF_AI_NAME = re.compile(
+    r"(?<!\w)(?:chatgpt|openai|gpt[- ]?4o?|gpt[- ]?5|copilot|gemini|bard|"
+    r"claude|anthropic|midjourney|dall[- .]?e|stable[- ]+diffusion|firefly|"
+    r"perplexity|llama|mistral|grok|generated\s+by\s+ai)(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _assert_pdf_text_unchanged(before_path: Path, after_path: Path, message: str) -> None:
+    import pymupdf
+
+    with pymupdf.open(before_path) as before, pymupdf.open(after_path) as after:
+        if [page.get_text() for page in before] != [page.get_text() for page in after]:
+            raise AdapterError(message)
+
+
+def _pdf_fallback(dest: Path, ctx: RunContext) -> list[dict[str, Any]]:
+    """Rewrite only our output copy, dropping AI Info entries and its XMP stream."""
+    import pikepdf
+
+    with pikepdf.open(dest) as pdf:
+        info = pdf.trailer.get("/Info", {})
+        keys = sorted(str(key) for key, value in info.items() if _PDF_AI_NAME.search(str(value)))
+        has_xmp = "/Metadata" in pdf.Root
+        if not keys and not has_xmp:
+            return []
+        for key in keys:
+            del info[key]
+        if has_xmp:
+            del pdf.Root["/Metadata"]
+        with tempfile.TemporaryDirectory(prefix="pdf-metadata-", dir=ctx.workdir) as tmp:
+            rewritten = Path(tmp) / "rewritten.pdf"
+            pdf.save(rewritten, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+            _assert_pdf_text_unchanged(dest, rewritten, "PDF metadata rewrite changed page text")
+            rewritten.replace(dest)
+    actions = [{"action": "removed", "what": f"PDF Info {key} (pikepdf fallback)", "count": 1}
+               for key in keys]
+    if has_xmp:
+        actions.append({"action": "removed", "what": "PDF XMP (pikepdf fallback)", "count": 1})
+    return actions
+
+
+def _pdf_metadata_residuals(dest: Path) -> list[dict[str, Any]]:
+    """Independently inspect current Info and XMP values, not the upstream report."""
+    import pikepdf
+
+    counts: dict[str, int] = {}
+
+    def check(key: str, value: str) -> None:
+        if _PDF_AI_NAME.search(value):
+            counts[key] = counts.get(key, 0) + 1
+
+    with pikepdf.open(dest) as pdf:
+        for key, value in pdf.trailer.get("/Info", {}).items():
+            check(str(key), str(value))
+        if "/Metadata" in pdf.Root:
+            xmp = pdf.Root.Metadata.read_bytes()
+            if xmp.strip():
+                try:
+                    root = ElementTree.fromstring(xmp)
+                except ElementTree.ParseError as exc:
+                    raise AdapterError("cannot verify PDF XMP metadata") from exc
+                for element in root.iter():
+                    if element.text:
+                        check(f"XMP {element.tag}", element.text)
+                    for key, value in element.attrib.items():
+                        check(f"XMP {key}", value)
+    return [{"action": "residual", "what": f"PDF metadata {key}", "count": count}
+            for key, count in sorted(counts.items())]
 
 
 class WatermarksRemoverAdapter:
@@ -96,6 +170,12 @@ class WatermarksRemoverAdapter:
         cleaned = self._json(proc.stdout)
         if not dest.is_file():
             raise AdapterError("watermarks-remover produced no output file")
+        exiftool_missing = shutil.which("exiftool") is None
+        is_pdf = before.get("kind") == "container" and before.get("format") == "pdf"
+        pdf_actions = _pdf_fallback(dest, ctx) if is_pdf and exiftool_missing else []
+        pdf_residuals = _pdf_metadata_residuals(dest) if is_pdf else []
+        if is_pdf:
+            _assert_pdf_text_unchanged(src, dest, "PDF cleaning changed page text")
         after = self._inspect(dest, ctx)
         c2_before = bool(before.get("has_c2pa", False))
         c2_after = bool(after.get("has_c2pa", False))
@@ -109,6 +189,11 @@ class WatermarksRemoverAdapter:
                                     "details": stats.get(action, {})})
         for native in cleaned.get("actions", []):
             if not isinstance(native, str) or native.lower().startswith("no "):
+                continue
+            lowered = native.casefold()
+            if "c2pa" in lowered and (not c2_before or lowered.startswith((
+                    "deep image pass not needed", "residual ai/c2pa", "c2patool available",
+                    "warning:"))):
                 continue
             layer = re.search(r"layer A text: removed=(\d+) replaced=(\d+)", native, re.IGNORECASE)
             if layer:
@@ -126,7 +211,7 @@ class WatermarksRemoverAdapter:
             # Native media actions do not always say C2PA. Match the part to the
             # pre-inspection evidence so partial removal is not silently omitted.
             for finding in before.get("findings", []):
-                if isinstance(finding, str) and "c2pa" in finding.casefold():
+                if c2_before and isinstance(finding, str) and "c2pa" in finding.casefold():
                     part = finding.split(":", 1)[0]
                     if "/" in part and part in native:
                         record["c2pa"] = True
@@ -134,14 +219,16 @@ class WatermarksRemoverAdapter:
         if c2_before and not c2_after:
             actions.append({"action": "removed", "what": "C2PA detected before cleaning",
                             "count": 1, "c2pa": True})
-        if c2_after:
+        if c2_before and c2_after:
             actions.append({"action": "residual", "what": "C2PA detected after cleaning",
                             "count": 1, "c2pa": True})
+        actions.extend(pdf_actions)
+        actions.extend(pdf_residuals)
         hits = after.get("layer_a_hits", after.get("hits", []))
-        residual = bool(c2_after or after.get("has_ai_metadata") or hits
+        residual = bool(c2_after or after.get("has_ai_metadata") or pdf_residuals or hits
                         or after.get("suspicious_total", 0))
         warnings = []
-        if shutil.which("exiftool") is None:
+        if exiftool_missing:
             warnings.append("exiftool unavailable: metadata inspection and PDF removal are less reliable")
         if shutil.which("c2patool") is None:
             warnings.append("c2patool unavailable: C2PA inspection cannot verify all manifests")

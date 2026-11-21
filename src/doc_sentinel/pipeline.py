@@ -42,7 +42,7 @@ def _run_inspect(adapter, src: Path, ctx: RunContext) -> AdapterOutcome:
 
 
 def _hidden_channels(findings: list[Finding]) -> list[Channel]:
-    """Text revealed by document-layer adapters, re-fed to the Unicode scanner + classifier."""
+    """Re-feed text revealed by document-layer adapters to the channel adapters."""
     seen: set[str] = set()
     channels = []
     for finding in findings:
@@ -74,13 +74,15 @@ def _check_input(src: Path) -> Path:
 
 
 def run_detect(src: Path, *, allow_network: bool = False, fail_on: str = "high",
-               timeout_s: float = 180.0) -> tuple[dict[str, Any], int]:
+               timeout_s: float = 180.0, prompt_guard: bool = False) -> tuple[dict[str, Any], int]:
     src = _check_input(src)
     dtype = detect_type(src)
     report = new_report("detect", src, dtype)
     adapters, mandatory = registry.detect_plan(dtype)
     if not adapters:
         raise UsageError(f"unsupported format for detect: {dtype}")
+    if prompt_guard:
+        adapters.append(registry.load("prompt-guard"))
     if dtype in registry.KNOWN_GAPS:
         report["warnings"].append(registry.KNOWN_GAPS[dtype])
 

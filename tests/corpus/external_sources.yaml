@@ -1,0 +1,16 @@
+# Pinned public, signed C2PA assets; downloaded only by fetch_public.py.
+sources:
+  - file: C.jpg
+    url: https://raw.githubusercontent.com/contentauth/c2pa-rs/0e92435c6d621c02c9bde2a8d82346295ed1f509/sdk/tests/fixtures/C.jpg
+    commit: 0e92435c6d621c02c9bde2a8d82346295ed1f509
+    license: MIT OR Apache-2.0
+    sha256: a2d14755db55de67a47c04090340d8266e892367be4104a45626d7a6fa6e9ffd
+    size: 132518
+    description: Signed JPEG with a C2PA manifest and algorithmicMedia digital source type.
+  - file: CA.jpg
+    url: https://raw.githubusercontent.com/contentauth/c2pa-rs/0e92435c6d621c02c9bde2a8d82346295ed1f509/sdk/tests/fixtures/CA.jpg
+    commit: 0e92435c6d621c02c9bde2a8d82346295ed1f509
+    license: MIT OR Apache-2.0
+    sha256: e71bff58fc57640803e6e65f7534e2fb0c2f99018c85276cc14b30f04427cc76
+    size: 166864
+    description: Signed JPEG with a C2PA manifest containing an ingredient.

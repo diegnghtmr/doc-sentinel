@@ -7,7 +7,7 @@ rationale are in [`PLAN.md`](./PLAN.md); agent rules are in [`AGENTS.md`](./AGEN
 
 ```text
 doc-sentinel clean  <file> [-o PATH] [--force-output] [--json] [--report PATH]
-doc-sentinel detect <file> [--json] [--report PATH] [--allow-network] [--fail-on high|medium]
+doc-sentinel detect <file> [--json] [--report PATH] [--allow-network] [--fail-on high|medium] [--prompt-guard]
 doc-sentinel update [--dry-run] [--only ID] [--json]
 doc-sentinel version
 doc-sentinel intent "<natural-language request>"   # -> clean | detect | update | detect+clean
@@ -38,9 +38,10 @@ If channel extraction fails (e.g. an archive part over the size limit), the verd
 | subtext-scan | detect: HTML hidden text + English instruction phrasing | Apache-2.0 | `node bin/subtext-scan.mjs scan --json` |
 | chk_defaced-rs | detect: ToUnicode / glyph remapping, invisible text | AGPL-3.0-only | separate process only (`bin/chk_defaced`) |
 | unicode-smuggling-guard | detect: tags, bidi, zero-width in extracted channels | MIT | library in a child process |
-| PurpleLlama / LlamaFirewall | detect: Prompt Guard 2 classifier on channels | MIT (LlamaFirewall) | child process, offline, never AlignmentCheck |
+| instruction-phrases (own glue) | detect: deterministic Spanish/English instruction rules on channels | MIT | in-process, offline, no model |
+| PurpleLlama / LlamaFirewall | detect: Prompt Guard 2 classifier on channels, explicit opt-in only | MIT (LlamaFirewall) | child process, offline, never AlignmentCheck |
 
-Own deterministic glue (added only where the user's samples proved a gap): channel extractor
+Other own deterministic glue (added only where the user's samples proved a gap): channel extractor
 (filename, metadata, comments, alt, links, tracked changes, embedded names, form fields, OCR),
 OOXML HTML-paste residue cleaner, OOXML library-fingerprint cleaner.
 
@@ -49,10 +50,8 @@ OOXML HTML-paste residue cleaner, OOXML library-fingerprint cleaner.
 ```bash
 git submodule update --init --recursive
 uv venv -p 3.12 .venv
-uv pip install -p .venv --index-strategy unsafe-best-match \
-  --extra-index-url https://download.pytorch.org/whl/cpu \
-  -e '.[dev,detect,promptguard]' -e 'third_party/perlecta-mcp[rendu]' \
-  -e third_party/unicode-smuggling-guard -e third_party/PurpleLlama/LlamaFirewall
+uv pip install -p .venv -e '.[dev,detect]' -e 'third_party/perlecta-mcp[rendu]' \
+  -e third_party/unicode-smuggling-guard
 (cd third_party/subtext-scan && npm ci --ignore-scripts)          # Node >= 22.13
 CARGO_TARGET_DIR=.cache/cargo cargo build --release \
   --manifest-path third_party/chk_defaced-rs/Cargo.toml && mkdir -p bin \
@@ -65,17 +64,17 @@ Without exiftool/c2patool, `clean` warns that metadata and C2PA verification are
 
 ### Prompt Guard 2 (gated model)
 
-`meta-llama/Llama-Prompt-Guard-2-86M` requires accepting the Llama license on Hugging Face.
-Download it once, with consent; `detect` then runs offline from the cache:
+The model is **never used by default**. An explicit `detect --prompt-guard` opt-in adds the
+local classifier as an optional channel adapter. It requires the `promptguard` Python extras
+and an already-cached `meta-llama/Llama-Prompt-Guard-2-86M` snapshot; the gated model's Llama
+license applies. Detection never downloads the model, even with `--allow-network`.
 
 ```bash
-hf auth login
-hf download meta-llama/Llama-Prompt-Guard-2-86M
+doc-sentinel detect example.pdf --json --prompt-guard
 ```
 
-Until it is cached the `prompt-guard` adapter is reported in `adapters_skipped`, and documents
-whose mandatory layers include it can never get a `clean` verdict (they get `error`, or
-`findings` if other layers already found something).
+If unavailable, the adapter appears in `adapters_skipped` without changing the verdict. The
+default ES/EN rules work without it; both rules and classifier can miss attacks.
 
 ## Containers
 
@@ -91,7 +90,9 @@ Both services run with `network_mode: none`; inputs are mounted read-only.
 - Statistical text watermarks (SynthID-Text, textGrain) and pixel watermarks are **not** removed:
   that would require rewriting content, which is prohibited (PLAN principle 2).
 - XLSX/PPTX/EPUB/ODT detect: extracted text only, no structural hidden-content analysis.
-- subtext-scan phrasing rules are English; Spanish injection relies on Prompt Guard 2.
+- subtext-scan phrasing rules are English; instruction-phrases adds deterministic ES/EN rules,
+  not general language understanding. Other languages, paraphrases, and extraction failures can
+  be missed; visible discussion can also produce medium-severity false positives.
 - OCR failures are currently skipped without a diagnostic in the report.
 
 ## Tests

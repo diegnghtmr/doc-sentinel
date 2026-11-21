@@ -1,8 +1,6 @@
 # doc-sentinel detect image. Runtime is meant to run with --network=none.
 # Build from the repository root (submodules initialised):
 #   docker build -f containers/Dockerfile.detect -t doc-sentinel-detect .
-# Prompt Guard 2 weights are NOT baked in (Llama license, gated on Hugging Face). Mount a
-# local Hugging Face cache read-only at /models (see compose.yaml).
 
 ARG RUST_VERSION=1.88
 ARG PYTHON_VERSION=3.12
@@ -16,7 +14,6 @@ RUN cargo build --release --locked && cp target/release/chk_defaced /chk_defaced
 FROM python:${PYTHON_VERSION}-slim-bookworm
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/models \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     DOC_SENTINEL_HOME=/opt/doc-sentinel
@@ -31,12 +28,12 @@ RUN pip install "uv>=0.4"
 WORKDIR /opt/doc-sentinel
 COPY . .
 COPY --from=chk_defaced /chk_defaced /opt/doc-sentinel/bin/chk_defaced
-RUN uv pip install --system --index-strategy unsafe-best-match \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -e '.[detect,promptguard]' \
+# Prompt Guard 2 (torch + LlamaFirewall) is not installed: the default linguistic layer is the
+# deterministic instruction-phrases glue. Opt-in images can add '.[promptguard]' and LlamaFirewall.
+RUN uv pip install --system \
+        -e '.[detect]' \
         -e 'third_party/perlecta-mcp[rendu]' \
         -e third_party/unicode-smuggling-guard \
-        -e third_party/PurpleLlama/LlamaFirewall \
     && (cd third_party/subtext-scan && npm ci --ignore-scripts --no-audit --no-fund)
 RUN useradd --create-home sentinel
 USER sentinel

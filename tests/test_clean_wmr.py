@@ -276,3 +276,305 @@ def test_real_office_media_metadata_and_unicode_cleaned_or_residual(tmp_path, ki
     assert result.residual or not any(marker in props for marker in
                                       (b"ChatGPT", b"Anthropic", b"OpenAI"))
     assert hashlib.sha256(src.read_bytes()).hexdigest() == digest
+
+
+@pytest.fixture
+def without_exiftool(tmp_path, monkeypatch):
+    """Hide optional programs in both the adapter and its child, retaining the sandbox."""
+    import shutil
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    unshare = shutil.which("unshare")
+    if unshare:
+        (tools / "unshare").symlink_to(unshare)
+    monkeypatch.setenv("PATH", str(tools))
+
+
+def _pdf_with_metadata(tmp_path, *, producer="ChatGPT", creator="Microsoft 365 Copilot",
+                       xmp=True):
+    pikepdf = pytest.importorskip("pikepdf")
+    canvas = pytest.importorskip("reportlab.pdfgen.canvas")
+    source = tmp_path / "base.pdf"
+    doc = canvas.Canvas(str(source))
+    doc.drawString(72, 720, "Visible text: ChatGPT is discussed here.")
+    doc.showPage()
+    doc.save()
+    target = tmp_path / "input.pdf"
+    with pikepdf.open(source) as pdf:
+        pdf.docinfo["/Producer"] = producer
+        pdf.docinfo["/Creator"] = creator
+        if xmp:
+            xml = (b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+                   b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                   b'<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+                   b'xmp:CreatorTool="Microsoft 365 Copilot"/>'
+                   b'</rdf:RDF></x:xmpmeta>')
+            pdf.Root.Metadata = pdf.make_stream(xml)
+            pdf.Root.Metadata.Type = pikepdf.Name.Metadata
+            pdf.Root.Metadata.Subtype = pikepdf.Name.XML
+        # Do not auto-wrap the XML in an xpacket: WMR's byte-only fallback
+        # misses this valid stream, so independent XMP inspection is exercised.
+        pdf.save(target, compress_streams=False, fix_metadata_version=False)
+    return target
+
+
+def _pdf_text(path):
+    fitz = pytest.importorskip("pymupdf")
+    with fitz.open(path) as pdf:
+        return [page.get_text() for page in pdf]
+
+
+@pytest.mark.integration
+def test_pdf_fallback_removes_ai_info_and_xmp_without_changing_text_or_input(
+        tmp_path, without_exiftool, capsys):
+    from doc_sentinel import cli
+
+    _require_real_wmr()
+    pikepdf = pytest.importorskip("pikepdf")
+    src = _pdf_with_metadata(tmp_path)
+    dest = tmp_path / "cleaned.pdf"
+    original_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+    original_text = _pdf_text(src)
+    assert b"ChatGPT" in src.read_bytes() and b"Microsoft 365 Copilot" in src.read_bytes()
+    code = cli.main(["clean", str(src), "-o", str(dest), "--json"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert (code, report["verdict"]) == (0, "cleaned")
+    assert captured.err == (f"doc-sentinel clean: verdict=cleaned\nfindings: none\n"
+                            f"output: {dest}\n")
+    assert not report["adapters_failed"]
+    assert report["c2pa"] == {"before": False, "after": False, "actions": []}
+    for key in ("/Producer", "/Creator"):
+        assert {"adapter": "watermarks-remover", "action": "removed",
+                "what": f"PDF Info {key} (pikepdf fallback)", "count": 1} in report["clean_actions"]
+    with pikepdf.open(dest) as pdf:
+        assert "/Producer" not in pdf.docinfo and "/Creator" not in pdf.docinfo
+        assert "/Metadata" not in pdf.Root or not pdf.Root.Metadata.read_bytes().strip()
+    assert b"ChatGPT" not in dest.read_bytes() and b"Microsoft 365 Copilot" not in dest.read_bytes()
+    assert _pdf_text(dest) == original_text
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original_sha
+
+
+@pytest.mark.integration
+def test_pdf_fallback_preserves_non_ai_producer(tmp_path, without_exiftool, capsys):
+    from doc_sentinel import cli
+
+    _require_real_wmr()
+    pikepdf = pytest.importorskip("pikepdf")
+    src = _pdf_with_metadata(tmp_path, producer="LibreOffice 7.6", creator="Ordinary editor")
+    dest = tmp_path / "cleaned.pdf"
+    original = hashlib.sha256(src.read_bytes()).hexdigest()
+    code = cli.main(["clean", str(src), "-o", str(dest), "--json"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert (code, report["verdict"]) == (0, "cleaned")
+    assert captured.err == (f"doc-sentinel clean: verdict=cleaned\nfindings: none\n"
+                            f"output: {dest}\n")
+    with pikepdf.open(dest) as pdf:
+        assert str(pdf.docinfo["/Producer"]) == "LibreOffice 7.6"
+        assert str(pdf.docinfo["/Creator"]) == "Ordinary editor"
+        assert "/Metadata" not in pdf.Root or not pdf.Root.Metadata.read_bytes().strip()
+    assert not any(action["what"].startswith("PDF Info /Producer")
+                   for action in report["clean_actions"])
+    assert _pdf_text(src) == _pdf_text(dest)
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original
+
+
+@pytest.mark.integration
+def test_pdf_residue_is_independently_reported_when_fallback_cannot_remove_it(
+        tmp_path, without_exiftool, monkeypatch, capsys):
+    from doc_sentinel import cli
+
+    _require_real_wmr()
+    src = _pdf_with_metadata(tmp_path)
+    dest = tmp_path / "cleaned.pdf"
+    original = hashlib.sha256(src.read_bytes()).hexdigest()
+    monkeypatch.setattr(_module(), "_pdf_fallback", lambda path, ctx: [], raising=False)
+    code = cli.main(["clean", str(src), "-o", str(dest), "--json"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert (code, report["verdict"]) == (1, "residual")
+    assert captured.err == (f"doc-sentinel clean: verdict=residual\nfindings: none\n"
+                            f"output: {dest}\n")
+    assert not report["adapters_failed"]
+    for key in ("/Producer", "/Creator", "XMP"):
+        assert any(action["action"] == "residual" and
+                   action["what"].startswith(f"PDF metadata {key}") and action["count"] >= 1
+                   for action in report["clean_actions"]), report["clean_actions"]
+    assert report["c2pa"] == {"before": False, "after": False, "actions": []}
+    assert _pdf_text(src) == _pdf_text(dest)
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original
+
+
+def test_no_c2pa_actions_without_preclean_c2pa(monkeypatch, tmp_path):
+    mod = _module()
+    src, dest = tmp_path / "in.docx", tmp_path / "out.docx"
+    src.write_bytes(b"original")
+    inspection = {"kind": "container", "has_c2pa": False, "has_ai_metadata": False,
+                  "layer_a_hits": []}
+
+    def fake_run(cmd, ctx, **kwargs):
+        if str(cmd[1]).endswith("/inspect_file.py"):
+            return SimpleNamespace(stdout=json.dumps(inspection), stderr="", returncode=0)
+        dest.write_bytes(b"cleaned")
+        return SimpleNamespace(stdout=json.dumps({"kind": "container", "actions": [
+            'deep image pass not needed for AI/C2PA markers',
+            'c2patool available for inspect; strip via exiftool/re-export',
+        ]}), stderr="", returncode=0)
+
+    monkeypatch.setattr(mod, "run_tool", fake_run)
+    result = _adapter().clean(src, dest, _ctx(tmp_path))
+    assert not result.c2pa_before and not result.c2pa_after and not result.residual
+    assert not any(action.get("c2pa") or "c2pa" in action["what"].lower()
+                   for action in result.actions)
+    assert src.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("c2_after", [False, True])
+def test_false_c2pa_before_never_marks_an_embedded_action_as_c2pa(
+        monkeypatch, tmp_path, c2_after):
+    mod = _module()
+    src, dest = tmp_path / "in.docx", tmp_path / "out.docx"
+    src.write_bytes(b"original")
+    before = {"kind": "container", "has_c2pa": False, "has_ai_metadata": False,
+              "layer_a_hits": [], "findings": ["word/media/image1.png: c2pa probe"]}
+    after = {"kind": "container", "has_c2pa": c2_after, "has_ai_metadata": False,
+             "layer_a_hits": []}
+
+    def fake_run(cmd, ctx, **kwargs):
+        if str(cmd[1]).endswith("/inspect_file.py"):
+            return SimpleNamespace(stdout=json.dumps(before if cmd[-1] == str(src) else after),
+                                   stderr="", returncode=0)
+        dest.write_bytes(b"cleaned")
+        return SimpleNamespace(stdout=json.dumps({"kind": "container", "actions": [
+            "clean embedded media in word/media/image1.png (drop PNG tEXt)"]}),
+            stderr="", returncode=0)
+
+    monkeypatch.setattr(mod, "run_tool", fake_run)
+    result = _adapter().clean(src, dest, _ctx(tmp_path))
+    assert result.c2pa_before is False and result.c2pa_after is c2_after
+    assert result.residual is c2_after
+    assert not any(action.get("c2pa") for action in result.actions)
+    assert src.read_bytes() == b"original"
+
+
+def test_c2pa_informational_messages_are_not_removal_actions(monkeypatch, tmp_path):
+    mod = _module()
+    src, dest = tmp_path / "in.docx", tmp_path / "out.docx"
+    src.write_bytes(b"original")
+
+    def fake_run(cmd, ctx, **kwargs):
+        if str(cmd[1]).endswith("/inspect_file.py"):
+            return SimpleNamespace(stdout=json.dumps({
+                "kind": "container", "has_c2pa": cmd[-1] == str(src),
+                "has_ai_metadata": False, "layer_a_hits": [],
+            }), stderr="", returncode=0)
+        dest.write_bytes(b"cleaned")
+        return SimpleNamespace(stdout=json.dumps({"kind": "container", "actions": [
+            "deep image pass not needed for AI/C2PA markers",
+            "residual AI/C2PA markers after document-level strip; running deep image pass",
+            "c2patool available for inspect; strip via exiftool/re-export",
+        ]}), stderr="", returncode=0)
+
+    monkeypatch.setattr(mod, "run_tool", fake_run)
+    result = _adapter().clean(src, dest, _ctx(tmp_path))
+    assert result.c2pa_before and not result.c2pa_after and not result.residual
+    assert result.actions == [{"action": "removed", "what": "C2PA detected before cleaning",
+                               "count": 1, "c2pa": True}]
+    assert src.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("marker", [
+    "ChatGPT", "OpenAI", "GPT-4", "GPT-4o", "GPT-5", "Copilot", "Gemini", "Bard",
+    "Claude", "Anthropic", "Midjourney", "DALL-E", "Stable Diffusion", "Firefly",
+    "Perplexity", "Llama", "Mistral", "Grok", "Generated by AI",
+])
+@pytest.mark.integration
+def test_pdf_ai_info_vocabulary_is_independently_verified(
+        tmp_path, without_exiftool, monkeypatch, marker):
+    adapter = _require_real_wmr()
+    src = _pdf_with_metadata(tmp_path, producer=marker, creator="Ordinary editor", xmp=False)
+    dest = tmp_path / "cleaned.pdf"
+    original = hashlib.sha256(src.read_bytes()).hexdigest()
+    monkeypatch.setattr(_module(), "_pdf_fallback", lambda path, ctx: [])
+    result = adapter.clean(src, dest, _ctx(tmp_path))
+    assert result.residual
+    assert {"action": "residual", "what": "PDF metadata /Producer", "count": 1} in result.actions
+    assert _pdf_text(src) == _pdf_text(dest)
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original
+
+
+@pytest.mark.integration
+def test_pdf_verification_is_also_independent_when_exiftool_is_available(
+        tmp_path, without_exiftool, monkeypatch):
+    import shutil
+
+    adapter = _require_real_wmr()
+    src = _pdf_with_metadata(tmp_path)
+    dest = tmp_path / "cleaned.pdf"
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name: "/simulated/exiftool" if name == "exiftool"
+                        else real_which(name))
+    result = adapter.clean(src, dest, _ctx(tmp_path))
+    assert result.residual
+    assert {"action": "residual", "what": "PDF metadata /Producer", "count": 1} in result.actions
+    assert any(action["what"].startswith("PDF metadata XMP ") for action in result.actions)
+    assert _pdf_text(src) == _pdf_text(dest)
+
+
+def test_pdf_clean_refuses_if_upstream_changes_page_text(tmp_path, without_exiftool, monkeypatch):
+    canvas = pytest.importorskip("reportlab.pdfgen.canvas")
+    src = _pdf_with_metadata(tmp_path)
+    original = hashlib.sha256(src.read_bytes()).hexdigest()
+    changed = tmp_path / "changed.pdf"
+    document = canvas.Canvas(str(changed))
+    document.drawString(72, 720, "A different page")
+    document.showPage()
+    document.save()
+    dest = tmp_path / "cleaned.pdf"
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "_inspect", lambda path, ctx: {
+        "kind": "container", "format": "pdf", "has_c2pa": False,
+        "has_ai_metadata": False, "layer_a_hits": [],
+    })
+
+    def changed_output(cmd, ctx, **kwargs):
+        dest.write_bytes(changed.read_bytes())
+        return SimpleNamespace(stdout=json.dumps({"kind": "container", "actions": []}),
+                               stderr="", returncode=0)
+
+    monkeypatch.setattr(_module(), "run_tool", changed_output)
+    with pytest.raises(AdapterError, match="page text"):
+        adapter.clean(src, dest, _ctx(tmp_path))
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original
+
+
+@pytest.mark.integration
+def test_pdf_fallback_refuses_output_if_rewrite_changes_page_text(
+        tmp_path, without_exiftool, monkeypatch):
+    import pymupdf
+
+    adapter = _require_real_wmr()
+    src = _pdf_with_metadata(tmp_path)
+    dest = tmp_path / "cleaned.pdf"
+    original_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+    real_open = pymupdf.open
+
+    class ChangedDocument:
+        def __enter__(self):
+            return [SimpleNamespace(get_text=lambda: "changed text")]
+
+        def __exit__(self, *args):
+            return False
+
+    def open_with_changed_rewrite(path):
+        if Path(path).name == "rewritten.pdf":
+            return ChangedDocument()
+        return real_open(path)
+
+    monkeypatch.setattr(pymupdf, "open", open_with_changed_rewrite)
+    with pytest.raises(AdapterError, match="PDF metadata rewrite changed page text"):
+        adapter.clean(src, dest, _ctx(tmp_path))
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == original_sha
+    assert _pdf_text(src) == _pdf_text(dest)
