@@ -63,9 +63,9 @@ function Write-LauncherError([string]$Message) { [Console]::Error.WriteLine($Mes
 function Show-Usage {
     @(
         'usage: doc-sentinel.ps1 [-Rebuild] [-StartTimeoutSeconds N] {clean,detect,sanitize,review-merge,version,intent} ...'
-        '  clean FILE [-o PATH] [--force-output] [--json|--agent-summary] [--report PATH]'
-        '  detect FILE [--sanitize [-o PATH] [--force-output]] [--agent-summary] [--review-dir DIR]'
-        '  sanitize FILE --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]'
+        '  clean FILE [-o PATH | --output-dir DIR] [--force-output] [--json|--agent-summary] [--report PATH]'
+        '  detect FILE [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--agent-summary] [--review-dir DIR]'
+        '  sanitize FILE --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]'
         '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'
         '  version | intent TEXT...'
         '  update and --allow-network require the Python CLI on the host.'
@@ -187,8 +187,8 @@ function Invoke-Launcher([string[]]$Arguments) {
     if (@('clean', 'detect', 'sanitize', 'review-merge', 'version', 'intent') -cnotcontains $mode) {
         Write-LauncherError "unknown command: $mode"; return 2
     }
-    $inputPath = ''; $outputPath = ''; $reportPath = ''; $reviewPath = ''; $json = $false; $agent = $false
-    $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @(); $sanitized = $mode -eq 'sanitize'
+    $inputPath = ''; $outputPath = ''; $outputDirOption = ''; $reportPath = ''; $reviewPath = ''; $json = $false; $agent = $false
+    $defaultCleanOutput = ''; $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @(); $sanitized = $mode -eq 'sanitize'
     if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'sanitize' -or $mode -eq 'review-merge') {
         while ($index -lt $Arguments.Count) {
             $arg = $Arguments[$index]; $index++
@@ -196,11 +196,13 @@ function Invoke-Launcher([string[]]$Arguments) {
             if ($arg -eq '--allow-network' -or $arg.StartsWith('--allow-network=')) {
                 Write-LauncherError '--allow-network is not available in the container launcher'; return 2
             }
-            if (@('-o', '--output', '--report', '--fail-on', '--review-dir') -ccontains $arg) {
+            if (@('-o', '--output', '--output-dir', '--report', '--fail-on', '--review-dir') -ccontains $arg) {
                 if ($index -ge $Arguments.Count -or -not $Arguments[$index]) { Write-LauncherError "missing value for $arg"; return 2 }
                 $value = $Arguments[$index]; $index++
                 if ($arg -eq '-o' -or $arg -eq '--output') {
                     if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }; $outputPath = $value
+                } elseif ($arg -eq '--output-dir') {
+                    if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }; $outputDirOption = $value
                 } elseif ($arg -eq '--report') { $reportPath = $value }
                 elseif ($arg -eq '--review-dir') {
                     if ($mode -eq 'clean') { Write-LauncherError "unknown option: $arg"; return 2 }; $reviewPath = $value
@@ -209,6 +211,9 @@ function Invoke-Launcher([string[]]$Arguments) {
                 if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }
                 if ($arg.StartsWith('--output=')) { $outputPath = $arg.Substring(9) } else { $outputPath = $arg.Substring(2) }
                 if (-not $outputPath) { Write-LauncherError 'missing value for --output'; return 2 }
+            } elseif ($arg.StartsWith('--output-dir=')) {
+                if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }
+                $outputDirOption = $arg.Substring(13); if (-not $outputDirOption) { Write-LauncherError 'missing value for --output-dir'; return 2 }
             } elseif ($arg.StartsWith('--report=')) {
                 $reportPath = $arg.Substring(9); if (-not $reportPath) { Write-LauncherError 'missing value for --report'; return 2 }
             } elseif ($arg.StartsWith('--review-dir=')) {
@@ -232,7 +237,8 @@ function Invoke-Launcher([string[]]$Arguments) {
             }
         }
         if ($json -and $agent) { Write-LauncherError '--json and --agent-summary are mutually exclusive'; return 2 }
-        if ($mode -eq 'detect' -and -not $sanitized -and ($outputPath -or $force)) {
+        if ($outputPath -and $outputDirOption) { Write-LauncherError '--output and --output-dir are mutually exclusive'; return 2 }
+        if ($mode -eq 'detect' -and -not $sanitized -and ($outputPath -or $outputDirOption -or $force)) {
             Write-LauncherError '--output and --force-output require --sanitize'; return 2
         }
         if ($mode -eq 'sanitize' -and -not $reviewPath) { Write-LauncherError 'sanitize requires --review-dir'; return 2 }
@@ -263,36 +269,36 @@ function Invoke-Launcher([string[]]$Arguments) {
             }
         }
         if ($mode -eq 'clean' -or $sanitized) {
-            if (-not $outputPath) {
+            if ($mode -eq 'clean' -and -not $outputPath -and -not $outputDirOption) {
                 $extension = [IO.Path]::GetExtension($inName)
-                if ($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) { $extension = '' }
+                if (($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) -or $inName.EndsWith('.')) { $extension = '' }
                 $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
-                $suffix = if ($sanitized) { 'sanitized' } else { 'cleaned' }
-                if ($sanitized) {
-                    try {
-                        $stream = [IO.File]::OpenRead($inputPath)
-                        try {
-                            $header = New-Object byte[] 1024
-                            $count = $stream.Read($header, 0, $header.Length)
-                        } finally { $stream.Dispose() }
-                        if ([Text.Encoding]::ASCII.GetString($header, 0, $count).Contains('%PDF-')) { $extension = '.docx' }
-                    } catch { Write-LauncherError 'cannot read input header'; return 2 }
+                $defaultCleanOutput = Join-Path $inDir "$stem.cleaned$extension"
+                $defaultItem = Get-Item -LiteralPath $defaultCleanOutput -Force -ErrorAction SilentlyContinue
+                if ($defaultItem -and $defaultItem.LinkType) { $outputPath = $defaultCleanOutput }
+            }
+            if ($outputPath) {
+                try { $outputPath = Resolve-HostPath $outputPath }
+                catch { Write-LauncherError 'output directory does not exist'; return 2 }
+                if (Test-SamePath -First $inputPath -Second $outputPath -Windows $windowsHost) {
+                    Write-LauncherError 'output path must differ from the input (no in-place cleaning)'; return 2
                 }
-                $outputPath = Join-Path $inDir "$stem.$suffix$extension"
+                $outDir = [IO.Path]::GetDirectoryName($outputPath); $outName = [IO.Path]::GetFileName($outputPath)
+            } else {
+                if (-not $outputDirOption) { $outputDirOption = $inDir }
+                try { $outDir = Resolve-HostPath $outputDirOption }
+                catch { Write-LauncherError 'output directory does not exist'; return 2 }
+                if (-not (Test-Path -LiteralPath $outDir -PathType Container)) {
+                    Write-LauncherError 'output directory does not exist'; return 2
+                }
             }
-            try { $outputPath = Resolve-HostPath $outputPath }
-            catch { Write-LauncherError 'output directory does not exist'; return 2 }
-            if (Test-SamePath -First $inputPath -Second $outputPath -Windows $windowsHost) {
-                Write-LauncherError 'output path must differ from the input (no in-place cleaning)'; return 2
-            }
-            $outDir = [IO.Path]::GetDirectoryName($outputPath); $outName = [IO.Path]::GetFileName($outputPath)
         }
         if ($reportPath) {
             try { $reportPath = Resolve-HostPath $reportPath }
             catch { Write-LauncherError 'report directory does not exist'; return 2 }
             $reportIsInput = $inputPath -and (Test-SamePath -First $reportPath -Second $inputPath -Windows $windowsHost)
             if ($mode -eq 'clean' -or $sanitized) {
-                if ($reportIsInput -or (Test-SamePath -First $reportPath -Second $outputPath -Windows $windowsHost)) {
+                if ($reportIsInput -or ($outputPath -and (Test-SamePath -First $reportPath -Second $outputPath -Windows $windowsHost))) {
                     Write-LauncherError 'report path must differ from the input and the output document'; return 2
                 }
             } elseif ($reportIsInput) { Write-LauncherError 'report path must differ from the input document'; return 2 }
@@ -323,7 +329,11 @@ function Invoke-Launcher([string[]]$Arguments) {
         $sharedReportDir = ($mode -eq 'clean' -or $sanitized) -and $reportPath -and (Test-SamePath -First $reportDir -Second $outDir -Windows $windowsHost)
         $containerArgs = @('doc-sentinel:local', $mode)
         if ($mode -ne 'review-merge') { $containerArgs += "/work/in/$inName" }
-        if ($mode -eq 'clean' -or $sanitized) { $containerArgs += @('-o', "/work/out/$outName"); if ($force) { $containerArgs += '--force-output' } }
+        if ($mode -eq 'clean' -or $sanitized) {
+            if ($outputPath) { $containerArgs += @('-o', "/work/out/$outName") }
+            else { $containerArgs += @('--output-dir', '/work/out') }
+            if ($force) { $containerArgs += '--force-output' }
+        }
         if ($json) { $containerArgs += '--json' }
         if ($agent) { $containerArgs += '--agent-summary' }
         if ($reportPath) {
@@ -337,6 +347,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         if ($agent) {
             if ($inputPath) { $displayEnvironment += "DOC_SENTINEL_HOST_INPUT=$inputDisplay" }
             if ($outputPath) { $displayEnvironment += "DOC_SENTINEL_HOST_OUTPUT=$outputPath" }
+            elseif ($mode -eq 'clean' -or $sanitized) { $displayEnvironment += "DOC_SENTINEL_HOST_OUTPUT_DIR=$outDir" }
             if ($reportPath) { $displayEnvironment += "DOC_SENTINEL_HOST_REPORT=$reportPath" }
             if ($reviewPath) { $displayEnvironment += "DOC_SENTINEL_HOST_REVIEW=$reviewPath" }
         }
@@ -346,7 +357,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         -ReviewDirectory $reviewPath -DisplayEnvironment $displayEnvironment -ContainerArguments $containerArgs)
     # Invoke the native process at script scope, not in a captured function pipeline.
     # This keeps its stdout/stderr connected to the caller instead of capturing its output.
-    $script:RunSpec = @{ Docker = $docker; Arguments = $runArgs; Mode = $mode; Output = $outputPath }
+    $script:RunSpec = @{ Docker = $docker; Arguments = $runArgs; Mode = $mode; Output = $outputPath; DefaultCleanOutput = $defaultCleanOutput }
     return 0
 }
 
@@ -358,6 +369,11 @@ $runArgs = $script:RunSpec.Arguments
 & $docker @runArgs
 $code = $LASTEXITCODE
 if ($script:RunSpec.Mode -eq 'clean' -and $code -eq 0) {
-    [Console]::Error.WriteLine("Cleaned copy: $($script:RunSpec.Output)")
+    $cleanOutput = $script:RunSpec.Output
+    if (-not $cleanOutput -and $script:RunSpec.DefaultCleanOutput) {
+        try { $cleanOutput = Resolve-HostPath $script:RunSpec.DefaultCleanOutput }
+        catch { $cleanOutput = $script:RunSpec.DefaultCleanOutput }
+    }
+    if ($cleanOutput) { [Console]::Error.WriteLine("Cleaned copy: $cleanOutput") }
 }
 exit $code

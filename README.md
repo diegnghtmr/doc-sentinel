@@ -6,9 +6,9 @@ orchestrating third-party sub-harnesses pinned to exact `main` SHAs. The design 
 rationale are in [`PLAN.md`](./PLAN.md); agent rules are in [`AGENTS.md`](./AGENTS.md).
 
 ```text
-doc-sentinel clean  <file> [-o PATH] [--force-output] [--json] [--report PATH]
-doc-sentinel detect <file> [--sanitize [-o PATH] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
-doc-sentinel sanitize <file> --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]
+doc-sentinel clean  <file> [-o PATH | --output-dir DIR] [--force-output] [--json] [--report PATH]
+doc-sentinel detect <file> [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
+doc-sentinel sanitize <file> --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]
 doc-sentinel review-merge --review-dir DIR [--report PATH] [--agent-summary]
 doc-sentinel update [--dry-run] [--only ID] [--json]
 doc-sentinel version
@@ -34,8 +34,13 @@ If channel extraction fails (e.g. an archive part over the size limit), the verd
 
 ## Optional sanitized copy
 
-When explicitly requested, use `detect FILE --sanitize --report REPORT --agent-summary`
-to scan the original and create `<stem>.sanitized<suffix>` beside it, or specify `-o`.
+When explicitly requested, use `detect FILE --sanitize --output-dir DIR --report REPORT --agent-summary`
+to scan the original and create `<stem>.sanitized<suffix>` in `DIR`. Without `--output-dir`
+or `-o` the copy is placed beside the input; these options are mutually exclusive. The same
+`--output-dir` option is available for `clean` and `sanitize`. Use the safe summary's output
+path rather than predicting a name: a filename injection selects `sanitized-document<suffix>`
+(or `sanitized-document.docx` for PDF). An explicit output that reuses the injection-bearing
+input name is refused, and the separate report records that the original name was not reused.
 For PDF input the output is a reconstructed `<stem>.sanitized.docx`; `-o` must end in `.docx`.
 After semantic review and `review-merge`, use `sanitize FILE --review-dir DIR --report
 REPORT --agent-summary`; the original input is mounted again and its SHA-256 must match
@@ -55,9 +60,12 @@ aggregate findings require every span meeting their criterion to be verified and
 sample present among those exclusions. Other partial or ambiguous findings are refused.
 Glyph/ToUnicode divergence or unlocatable PDF hidden text is refused rather than guessed.
 Checks include opening the copy, extraction deltas, re-detection,
-and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). Tracked changes
-use the final view: deletions are removed, insertions are accepted, and rendering is compared
-against a final-view copy of the original.
+and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). DOCX rendering
+is accepted on exact pixels, or as `equivalent_with_reflow` only when rendered visible text is
+unchanged except for authorized removals, page counts match and every page scores at least 0.97
+on the visual similarity metric. The safe summary exposes the render mode, not removed text.
+Tracked changes use the final view: deletions are removed, insertions are accepted, and rendering
+is compared against a final-view copy of the original.
 
 PDF reconstruction uses visible content, not an editable copy of the original PDF:
 
@@ -121,12 +129,59 @@ default ES/EN rules work without it; both rules and classifier can miss attacks.
 
 ## Containers
 
+One image, `doc-sentinel:local` (`containers/Dockerfile`, about 1.5 GB), holds the complete
+harness: every pinned sub-harness, chk_defaced as a separate binary, Tesseract (spa/eng), qpdf,
+exiftool, c2patool and headless LibreOffice (needed by the DOCX/PDF sanitize render checks).
+It never contains your documents (`.dockerignore`) and runs as uid 10001 with no network,
+a read-only root, `/tmp` as tmpfs, all capabilities dropped and `no-new-privileges`.
+
+The launchers build the image on first use and pass the same arguments as the CLI:
+
+```bash
+scripts/doc-sentinel-docker.sh detect inbox/file.pdf --agent-summary --report reports/file.json
+scripts/doc-sentinel-docker.sh clean  inbox/file.docx -o reports/file.cleaned.docx
+scripts/doc-sentinel-docker.sh detect inbox/file.docx --sanitize --output-dir reports --report reports/file.json --agent-summary
+```
+
+The input's folder is mounted read-only; outputs, reports and review directories are mounted
+read-write separately. `update` and `--allow-network` are refused inside the container: run
+`update` from a git checkout with the host CLI.
+
+### Windows 11 (Docker Desktop)
+
+`detect` cannot run natively on Windows (it needs Linux network namespaces and Perlecta's POSIX
+confinement), so on Windows doc-sentinel always runs in the container.
+
+1. Install Docker Desktop (`winget install -e --id Docker.DockerDesktop`) and keep it in
+   **Linux containers** mode (the default).
+2. Clone with submodules: `git clone --recursive <repo>` (or
+   `git submodule update --init --recursive` in an existing clone).
+3. From the repository folder, in PowerShell or `cmd`:
+
+   ```powershell
+   .\scripts\doc-sentinel.cmd detect "C:\Users\you\Documents\exam.docx" --agent-summary --report "C:\Users\you\Documents\exam.report.json"
+   .\scripts\doc-sentinel.cmd detect "C:\Users\you\Documents\exam.docx" --sanitize
+   .\scripts\doc-sentinel.cmd clean  "C:\Users\you\Documents\exam.docx"
+   ```
+
+The launcher detects Windows 11 (build 22000 or later; older builds get a warning), starts
+Docker Desktop and waits for it when it is not running, refuses Windows-containers mode, builds
+the image the first time (several minutes, needs internet once), validates on the host that the
+output and report are not the input, and maps your folders to the container mounts. Output and
+report folders must already exist. Paths with spaces and accents are supported. Exit codes and
+JSON output are passed through unchanged, so coding agents (Claude Code, Codex, Copilot, ...)
+follow the same `AGENTS.md` flow on Windows.
+
+Status: the PowerShell launcher is tested on Linux PowerShell with a simulated `docker`; the
+Windows-specific branches (build detection, Docker Desktop start, drive-letter paths) are
+simulated and still need a run on a real Windows 11 machine.
+
+`containers/compose.yaml` offers the same hardening for manual use:
+
 ```bash
 docker compose -f containers/compose.yaml run --rm detect detect /work/in/file.pdf --json
 docker compose -f containers/compose.yaml run --rm clean  clean  /work/in/file.pdf -o /work/out/file.cleaned.pdf
 ```
-
-Both services run with `network_mode: none`; inputs are mounted read-only.
 
 ## Known gaps (not covered, by design or by the pinned tools)
 

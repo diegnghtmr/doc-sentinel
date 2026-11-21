@@ -459,16 +459,22 @@ def _pdf_channels(src: Path, regions: list[dict]):
     channels = [c for c in extract_channels(src, "pdf") if c.channel != "body"]
     hidden = [Channel("body", r["text"], pointer="page text", page=r["page"], hidden=True)
               for r in regions]
+    from doc_sentinel.sanitize import _normalized
+
     with pymupdf.open(src) as pdf:
         for page in pdf:
             for block in page.get_text("dict")["blocks"]:
+                lines = []
                 for line in block.get("lines", []):
                     text = "".join(span["text"] for span in line["spans"])
                     for region in regions:
                         if region["page"] == page.number + 1:
                             text = text.replace(region["text"], "")
                     if text.strip():
-                        channels.append(Channel("body", text, pointer="page text", page=page.number + 1))
+                        lines.append(text)
+                if lines:
+                    channels.append(Channel("body", _normalized(" ".join(lines)),
+                                            pointer="page text", page=page.number + 1))
     return channels, hidden, []
 
 
@@ -557,7 +563,8 @@ def _sanitize_spans(src: Path, report: dict, plan: dict | None, review_root: Pat
     adapter = InstructionPhrasesAdapter()
     findings = [f for f in report["findings"] if f.get("class") in _INJECTIONS]
     phrase_channels = {f["location"]["channel"] for f in findings
-                       if "instruction-phrases" in f.get("adapter", [])}
+                       if "instruction-phrases" in f.get("adapter", [])
+                       and f["location"]["channel"] != "filename"}
     with tempfile.TemporaryDirectory(prefix="doc-sentinel-span-") as tmp:
         for channel in [*channels, *hidden]:
             if channel.channel not in phrase_channels and not channel.hidden:
@@ -584,8 +591,9 @@ def _sanitize_spans(src: Path, report: dict, plan: dict | None, review_root: Pat
     if phrase_channels - covered:
         return [], hidden_ranges, "detected injection has no exact editable source span"
 
+    handled = []
     if plan is not None and review_root is not None:
-        from doc_sentinel.review import MARKER, review_fragments
+        from doc_sentinel.review import HIDDEN_CLASSES, MARKER, review_fragments
 
         fragments = review_fragments(review_root, plan)
         for item in report.get("_sanitize_review_origins", []):
@@ -593,16 +601,31 @@ def _sanitize_spans(src: Path, report: dict, plan: dict | None, review_root: Pat
             if not isinstance(fragment, str) or not fragment:
                 return [], hidden_ranges, "reviewed injection has no exact editable source span"
             loc = item["origin"]
+            source_finding = item.get("source_finding") or {}
             needle = _norm(fragment.replace(MARKER, " "))
+            if loc["channel"] == "filename":
+                handled.append(source_finding)
+                continue  # The CLI guards the output name separately.
+            if loc["hidden"] or source_finding.get("class") in HIDDEN_CLASSES:
+                texts = [c.text for c in hidden if MARKER not in c.text]
+                if not any(needle in _norm(text) for text in [*texts, "".join(texts), " ".join(texts)]):
+                    return [], hidden_ranges, "reviewed hidden content cannot be located"
+                handled.append(source_finding)
+                continue
+            if dtype == "docx" and loc["channel"] == "body":
+                from doc_sentinel.sanitize.docx import reviewed_mixed_spans
+
+                mixed = reviewed_mixed_spans(src, loc["pointer"], fragment.replace(MARKER, " "))
+                if mixed is not None:
+                    spans.extend(mixed)
+                    handled.append(source_finding)
+                    continue
             options = [(c, sentence) for c in channels
                        if c.channel == loc["channel"] and c.pointer == loc["pointer"]
                        and (dtype != "pdf" or c.page == loc["page"])
                        and MARKER not in c.text
                        for sentence in _sentences(c.text) if needle in _norm(sentence)]
             if len(options) != 1:
-                if loc["hidden"] and any(c.channel == loc["channel"] and c.pointer == loc["pointer"]
-                                         and MARKER not in c.text and needle in _norm(c.text) for c in hidden):
-                    continue
                 return [], hidden_ranges, "reviewed injection has no exact editable sentence"
             channel, sentence = options[0]
             span = {"channel": channel.channel, "pointer": channel.pointer, "text": sentence}
@@ -611,15 +634,26 @@ def _sanitize_spans(src: Path, report: dict, plan: dict | None, review_root: Pat
                 if channel.channel == "metadata" and sentence != channel.text:
                     return [], hidden_ranges, "PDF metadata injection is not an entire value"
             spans.append(span)
+            handled.append(source_finding)
     for finding in findings:
         adapters = finding.get("adapter", [])
         if not ({"instruction-phrases", "agent-review"} & set(adapters)):
-            return [], hidden_ranges, "detected injection has no exact editable source span"
+            matched = any(source and source.get("class") == finding.get("class") and
+                          source.get("excerpt") == finding.get("excerpt") and
+                          source.get("location") == finding.get("location") for source in handled)
+            if not matched:
+                return [], hidden_ranges, "detected injection has no exact editable source span"
     unique = []
     for span in spans:
         if span not in unique:
             unique.append(span)
     return unique, hidden_ranges, None
+
+
+def has_filename_injection(report: dict) -> bool:
+    return (any(item.get("class") == "filename_injection" for item in report.get("findings", [])) or
+            any(item.get("origin", {}).get("channel") == "filename"
+                for item in report.get("_sanitize_review_origins", [])))
 
 
 def run_sanitize(src: Path, dest: Path, target, report: dict, detect_code: int, *,
@@ -640,6 +674,8 @@ def run_sanitize(src: Path, dest: Path, target, report: dict, detect_code: int, 
         result = refused("original input missing or changed since detection")
     elif report["verdict"] == "error":
         result = refused("detection did not complete safely")
+    elif has_filename_injection(report) and src.stem.casefold() in dest.name.casefold():
+        result = refused("output name reuses the injection-bearing input filename")
     else:
         glyph = any(f.get("class") == "tounicode_mismatch" for f in report["findings"])
         dtype = report["input"]["detected_type"]
@@ -669,7 +705,8 @@ def run_sanitize(src: Path, dest: Path, target, report: dict, detect_code: int, 
                 result = refused(reason)
             else:
                 with tempfile.TemporaryDirectory(prefix="doc-sentinel-sanitize-") as tmp:
-                    candidate = Path(tmp) / (dest.name if dtype == "pdf" else "candidate" + src.suffix)
+                    candidate = Path(tmp) / (dest.name if dtype == "pdf" or has_filename_injection(report)
+                                                 else "candidate" + src.suffix)
                     engine_spans = ([{k: span[k] for k in ("channel", "page", "text")}
                                      for span in spans if span["channel"] != "metadata"]
                                     if dtype == "pdf" else spans)
@@ -679,6 +716,13 @@ def run_sanitize(src: Path, dest: Path, target, report: dict, detect_code: int, 
                                       has_unlocatable_hidden=unlocatable)
                     if unlocatable and result.status == "refused":
                         result.refusal_reason = location_reason
+                    if result.status == "nothing_to_do" and has_filename_injection(report):
+                        shutil.copyfile(src, candidate)
+                        result = SanitizeResult("sanitized", actions=[{
+                            "format": dtype, "part": "filename", "location": None,
+                            "technique": "filename-injection", "visibility": "hidden",
+                            "reason": "the injection-bearing original filename was not reused",
+                            "removed_text": src.name}], checks=result.checks)
                     if dtype == "pdf":
                         for action in result.actions:
                             action["page"] = int(action["part"].split()[-1])
@@ -724,6 +768,9 @@ def run_sanitize(src: Path, dest: Path, target, report: dict, detect_code: int, 
                             atomic_write_bytes(target, candidate.read_bytes())
         except (OSError, ValueError, TypeError, UnicodeError) as exc:
             result = refused(f"cannot sanitize safely: {exc}")
+    if result.status == "sanitized" and has_filename_injection(report) and not any(
+            "original filename was not reused" in warning for warning in report["warnings"]):
+        report["warnings"].append("original filename was not reused because it was marked as an injection")
     report.pop("_sanitize_review_origins", None)
     report["sanitize"] = {"status": result.status,
                           "output_path": str(dest) if result.status == "sanitized" else None,

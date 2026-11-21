@@ -379,6 +379,35 @@ def test_merge_report_refuses_target_with_original_content_even_if_input_unmount
     assert alias.read_bytes() == original
 
 
+def test_semantic_review_retains_distinct_empty_excerpt_locations(monkeypatch, scratch, capsys):
+    from doc_sentinel import pipeline
+
+    text = "Synthetic repeated review fragment."
+    channels = [Channel("metadata", text, pointer=pointer, source=source) for pointer, source in (
+        ("first", "extract"), ("second", "extract"), ("third", "extract"),
+        ("first", "another-source"))]
+    monkeypatch.setattr(pipeline, "extract_channels", lambda src, dtype: channels)
+    setup_detect(monkeypatch)
+    src, review, report = scratch / "source.txt", scratch / "review", scratch / "merged.json"
+    src.write_text("Ordinary text.", encoding="utf-8")
+    before = src.read_bytes()
+    code, stdout, stderr = run(["detect", str(src), "--review-dir", str(review),
+                                "--agent-summary"], capsys)
+    assert (code, json.loads(stdout)["verdict"]) == (0, "clean") and stderr
+    plan = json.loads((review / "plan.json").read_text())
+    assert len(plan["batches"]) == 1 and len(plan["batches"][0]["task_ids"]) == 1
+    write_answer(review, plan, [{"task_id": plan["batches"][0]["task_ids"][0],
+                                 "label": "injection", "score": 0.95}])
+    code, stdout, stderr = run(["review-merge", "--review-dir", str(review), "--report", str(report),
+                                "--agent-summary"], capsys)
+    safe, merged = json.loads(stdout), json.loads(report.read_text())
+    semantic = [f for f in merged["findings"] if "agent-review" in f["adapter"]]
+    assert (code, safe["verdict"], safe["review_errors"]) == (1, "findings", []) and stderr
+    assert safe["counts"]["adapter"]["agent-review"] == 3
+    assert [f["location"]["pointer"] for f in semantic] == ["first", "second", "third"]
+    assert all(f["excerpt"] == "" for f in semantic) and src.read_bytes() == before
+
+
 def test_deduplicated_fragment_keeps_every_location(monkeypatch, scratch, capsys):
     from doc_sentinel import pipeline
 

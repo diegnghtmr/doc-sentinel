@@ -391,13 +391,22 @@ def _validate_spans(pages, hidden_regions, injection_spans):
             continue
         if span.get("channel") != "body":
             raise ValueError("non-body injection spans cannot be reconstructed safely")
-        chars = [char for line in pages[number-1].lines for char in line.chars]
-        text = "".join(char.text for char in chars)
-        start = text.find(span["text"])
-        if start < 0 or text.find(span["text"], start + 1) >= 0:
+        # The planner joins wrapped PDF lines with spaces; retain a map back to
+        # real characters so synthetic separators are never edited as glyphs.
+        chars = []
+        for line in pages[number-1].lines:
+            if chars:
+                chars.append(None)
+            chars.extend(line.chars)
+        text = "".join(char.text if char is not None else " " for char in chars)
+        normalized, positions = _normalized_positions(text)
+        wanted = _normalized(span["text"])
+        start = normalized.find(wanted) if wanted else -1
+        if start < 0 or normalized.find(wanted, start + 1) >= 0:
             raise ValueError("injection span is missing or ambiguous")
-        for char in chars[start:start + len(span["text"])]:
-            if not char.technique:
+        begin, end = positions[start], positions[start + len(wanted) - 1] + 1
+        for char in chars[begin:end]:
+            if char is not None and not char.technique:
                 char.technique, char.reason, char.visibility = (
                     "visible-injection", "caller supplied an exact injection fragment", "visible")
     return link_actions

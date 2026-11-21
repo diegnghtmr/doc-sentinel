@@ -110,6 +110,30 @@ def test_pdf_summary_similarity_is_numeric_only(scores, expected):
     assert "HOSTILE" not in json.dumps(summary)
 
 
+@pytest.mark.parametrize("mode,expected", [("exact", "exact"), ("equivalent_with_reflow", "equivalent_with_reflow"),
+                                           ("HOSTILE", None), (None, None)])
+def test_render_mode_is_allowlisted(mode, expected):
+    from doc_sentinel.agent_summary import make_summary
+
+    report = {"verdict": "findings", "findings": [], "sanitize": {
+        "status": "sanitized", "checks": {"render_equal": {"status": "passed", "mode": mode}}, "actions": []}}
+    safe = make_summary(report, mode="detect", exit_code=1, input_path="source.docx",
+                        output_path="out.docx", report_path=None)
+    assert safe["sanitize"].get("render_mode") == expected
+    assert "HOSTILE" not in json.dumps(safe)
+
+
+@pytest.mark.parametrize("reason", ["rendered visible text changed", "rendered visual similarity below 0.97",
+                                     "page count changed"])
+def test_safe_summary_reports_known_render_refusals(reason):
+    from doc_sentinel.agent_summary import make_summary
+
+    report = {"verdict": "findings", "sanitize": {"status": "refused", "refusal_reason": reason}}
+    safe = make_summary(report, mode="detect", exit_code=2, input_path="input.docx",
+                        output_path=None, report_path=None)
+    assert safe["sanitize"]["refusal_reason"] == reason
+
+
 def test_json_and_agent_summary_are_mutually_exclusive(scratch, capsys):
     src = scratch / "x.txt"
     src.write_text("ordinary", encoding="utf-8")

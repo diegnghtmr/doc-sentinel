@@ -31,17 +31,20 @@ def _overlap(a: list[float] | None, b: list[float] | None) -> bool:
 
 
 def _same(a: Finding, b: Finding) -> bool:
+    excerpt = _norm(a.excerpt)
     return (a.cls == b.cls
             and a.location.channel == b.location.channel
             and a.location.page == b.location.page
             and _overlap(a.location.bbox, b.location.bbox)
-            and _norm(a.excerpt) == _norm(b.excerpt))
+            and excerpt == _norm(b.excerpt)
+            and (bool(excerpt) or a.location.pointer == b.location.pointer))
 
 
 def dedupe(findings: Iterable[Finding]) -> list[Finding]:
-    """Merge findings with same class, channel, page, overlapping bbox and normalized excerpt.
+    """Merge matching findings; empty excerpts additionally require equal pointers.
 
-    No voting: the merged finding keeps the maximum severity, lists every adapter, and keeps
+    Class, channel, page, overlapping bbox and normalized excerpt must match. No voting:
+    the merged finding keeps the maximum severity, lists every adapter, and keeps
     the evidence of each later adapter under ``evidence["merged_evidence"][<adapter>]``.
     """
     merged: list[Finding] = []

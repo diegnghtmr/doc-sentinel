@@ -124,10 +124,10 @@ def test_agents_uses_only_the_s13_s14_command_flows():
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     contract = {
         ("detect", frozenset({"--report", "--agent-summary", "--review-dir"})),
-        ("detect", frozenset({"--sanitize", "-o", "--report", "--agent-summary"})),
-        ("sanitize", frozenset({"--review-dir", "-o", "--report", "--agent-summary"})),
+        ("detect", frozenset({"--sanitize", "--output-dir", "--report", "--agent-summary"})),
+        ("sanitize", frozenset({"--review-dir", "--output-dir", "--report", "--agent-summary"})),
         ("review-merge", frozenset({"--review-dir", "--report", "--agent-summary"})),
-        ("clean", frozenset({"-o", "--report", "--agent-summary"})),
+        ("clean", frozenset({"--output-dir", "--report", "--agent-summary"})),
         ("update", frozenset({"--json"})),
     }
     commands = [shlex.split(line.strip()) for line in text.splitlines()
@@ -168,3 +168,16 @@ def test_reviewer_contracts_name_the_datamarking_marker():
     for path in files:
         text = path.read_text(encoding="utf-8")
         assert "U+2581" in text and MARKER in text, path
+
+
+def test_never_read_rules_are_scoped_to_the_orchestrator_with_reviewer_exception():
+    # Found end-to-end: reviewer subagents loaded AGENTS.md and refused to read their batch.
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    section = agents.split("## Never read the document", 1)[1].split("\n## ", 1)[0]
+    assert "orchestrat" in section.lower()
+    assert "doc-sentinel-reviewer" in section
+    assert "docs/reviewer-prompt.md" in section
+    assert "exactly the one batch file" in section
+    claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "doc-sentinel-reviewer" in claude and "docs/reviewer-prompt.md" in claude
+    assert "only its assigned batch file" in claude
