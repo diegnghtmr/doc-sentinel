@@ -1,0 +1,46 @@
+# Never put personal documents, local work, or generated corpus fixtures in the build context.
+/*.docx
+/*.xlsx
+/*.pptx
+/*.pdf
+/*.doc
+/*.odt
+/*.rtf
+/*.txt
+/*.csv
+/*.eml
+/*.html
+/*.htm
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+# Test documents in vendored submodules are not needed by the runtime either.
+**/*.docx
+**/*.xlsx
+**/*.pptx
+**/*.pdf
+**/*.doc
+**/*.odt
+*.cleaned.*
+/samples/
+/inbox/
+/work/
+/reports/
+/tests/corpus/generated/
+
+# Local environments, caches, compiled binaries, and repository/agent metadata.
+/.venv/
+/.cache/
+**/.env
+**/.env.*
+/bin/
+/.git/
+**/.git
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+/third_party/subtext-scan/node_modules/
+/odd/
+/.atl/

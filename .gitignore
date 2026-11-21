@@ -17,3 +17,7 @@ dist/
 /tests/corpus/generated/
 # Local tool builds
 /bin/
+/*.pptx
+/*.xlsx
+/*.pdf
+/inbox/

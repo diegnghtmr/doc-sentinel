@@ -1,0 +1,34 @@
+name: update-dry-run
+
+# Reports pins whose upstream main moved. It never moves a pin: `doc-sentinel update`
+# (run by a human or an agent on request) does that, with tests and rollback.
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - id: dry
+        run: |
+          doc-sentinel update --dry-run --json > update.json || true
+          python -c "import json;d=json.load(open('update.json'));print('moved=' + ','.join(p['id'] for p in d['pins'] if p['status']=='would_update'))" >> "$GITHUB_OUTPUT"
+      - if: steps.dry.outputs.moved != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --title "Pinned sub-harnesses moved upstream: ${{ steps.dry.outputs.moved }}" \
+            --body "Run \`doc-sentinel update\` locally to test and move the pins.\n\n\`\`\`json\n$(cat update.json)\n\`\`\`"

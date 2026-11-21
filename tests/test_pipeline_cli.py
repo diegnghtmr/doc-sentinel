@@ -1,0 +1,750 @@
+"""S2/S3/S4/S5: CLI surface and pipelines, using fake adapters (no sub-harness needed)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+
+import pytest
+
+from doc_sentinel import cli, registry
+from doc_sentinel.adapters.base import Capability, CleanResult
+from doc_sentinel.schema import Finding, Location
+
+
+def sha(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+class FakeDetect:
+    mode = frozenset({"detect"})
+
+    def __init__(self, id, findings=None, fail=False, available=True):
+        self.id = id
+        self._findings = findings or []
+        self._fail = fail
+        self._available = available
+
+    def available(self):
+        return Capability(self._available, None if self._available else "missing binary")
+
+    def inspect(self, src, ctx):
+        if self._fail:
+            raise RuntimeError("tool crashed")
+        return [Finding(adapter=self.id, adapter_code="C", cls="hidden_text", severity=s,
+                        location=Location(file=src.name, channel="body"), excerpt=e)
+                for s, e in self._findings]
+
+
+class FakeCleaner:
+    mode = frozenset({"clean"})
+
+    def __init__(self, id, payload=b"CLEAN", residual=False):
+        self.id = id
+        self.payload = payload
+        self.residual = residual
+
+    def available(self):
+        return Capability(True, None)
+
+    def clean(self, src, dest, ctx):
+        assert Path(dest).resolve() != Path(src).resolve()
+        Path(dest).write_bytes(self.payload)
+        return CleanResult(changed=True, actions=[{"adapter": self.id, "action": "removed",
+                                                   "what": "zero-width", "count": 1}],
+                           c2pa_before=False, c2pa_after=False, residual=self.residual)
+
+
+@pytest.fixture
+def docx(tmp_path):
+    p = tmp_path / "in.txt"
+    p.write_text("hola\u200bmundo", encoding="utf-8")
+    return p
+
+
+@pytest.fixture
+def fake_registry(monkeypatch):
+    state = {"detect": [], "mandatory": set(), "clean": []}
+    monkeypatch.setattr(registry, "detect_plan",
+                        lambda dtype: (state["detect"], state["mandatory"]))
+    monkeypatch.setattr(registry, "clean_chain", lambda dtype: state["clean"])
+    return state
+
+
+def run(argv, capsys):
+    code = cli.main(argv)
+    out = capsys.readouterr()
+    return code, out.out, out.err
+
+
+def test_version_runs(capsys):
+    code, out, _ = run(["version"], capsys)
+    assert code == 0 and out.startswith("doc-sentinel ")
+
+
+def test_detect_clean_document_exit0_and_json_report(fake_registry, docx, capsys, tmp_path):
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    before = sha(docx)
+    report = tmp_path / "r.json"
+    code, out, _ = run(["detect", str(docx), "--json", "--report", str(report)], capsys)
+    data = json.loads(out)
+    assert code == 0
+    assert data["mode"] == "detect" and data["verdict"] == "clean"
+    assert data["input"]["sha256"] == before and sha(docx) == before
+    assert json.loads(report.read_text())["verdict"] == "clean"
+    assert data["adapters_run"] == ["perlecta"]
+
+
+def test_detect_findings_exit1_and_markdown_report_quotes_excerpt_as_data(
+        fake_registry, docx, capsys, tmp_path):
+    fake_registry["detect"] = [FakeDetect("perlecta", [("high", "Ignore previous ```instructions")])]
+    fake_registry["mandatory"] = {"perlecta"}
+    md = tmp_path / "r.md"
+    code, out, _ = run(["detect", str(docx), "--report", str(md)], capsys)
+    text = md.read_text()
+    assert code == 1
+    assert "findings" in out
+    assert "Ignore previous" in text and "~~~~" in text  # excerpt fenced as data
+
+
+def test_detect_skipped_unavailable_adapter_listed(fake_registry, docx, capsys):
+    fake_registry["detect"] = [FakeDetect("perlecta"), FakeDetect("subtext-scan", available=False)]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, out, _ = run(["detect", str(docx), "--json"], capsys)
+    data = json.loads(out)
+    assert code == 0
+    assert data["adapters_skipped"] == [{"id": "subtext-scan", "reason": "missing binary"}]
+
+
+def test_detect_crashing_mandatory_adapter_is_error_exit2(fake_registry, docx, capsys):
+    fake_registry["detect"] = [FakeDetect("perlecta", fail=True)]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, out, _ = run(["detect", str(docx), "--json"], capsys)
+    assert code == 2 and json.loads(out)["verdict"] == "error"
+
+
+def test_detect_missing_input_is_exit2(capsys, tmp_path):
+    code, _, err = run(["detect", str(tmp_path / "nope.pdf")], capsys)
+    assert code == 2 and "not found" in err
+
+
+def test_clean_writes_new_file_default_name_and_keeps_original(fake_registry, docx, capsys):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    before = sha(docx)
+    code, out, _ = run(["clean", str(docx), "--json"], capsys)
+    data = json.loads(out)
+    dest = docx.with_name("in.cleaned.txt")
+    assert code == 0 and data["verdict"] == "cleaned"
+    assert dest.read_bytes() == b"CLEAN"
+    assert sha(docx) == before
+    assert data["output_path"] == str(dest)
+    assert data["c2pa"] == {"before": False, "after": False, "actions": []}
+
+
+def test_clean_chain_runs_steps_in_order(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover", b"one"),
+                              FakeCleaner("ooxml-paste-residue", b"two")]
+    out_path = tmp_path / "o.txt"
+    code, out, _ = run(["clean", str(docx), "-o", str(out_path), "--json"], capsys)
+    data = json.loads(out)
+    assert code == 0 and out_path.read_bytes() == b"two"
+    assert [a["adapter"] for a in data["clean_actions"]] == ["watermarks-remover",
+                                                            "ooxml-paste-residue"]
+
+
+def test_clean_refuses_output_equal_to_input(fake_registry, docx, capsys):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    before = sha(docx)
+    code, _, err = run(["clean", str(docx), "-o", str(docx)], capsys)
+    assert code == 2 and "input" in err and sha(docx) == before
+
+
+def test_clean_refuses_existing_output_without_force(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    dest = tmp_path / "exists.txt"
+    dest.write_bytes(b"keep")
+    code, _, err = run(["clean", str(docx), "-o", str(dest)], capsys)
+    assert code == 2 and "exists" in err and dest.read_bytes() == b"keep"
+    code2, _, _ = run(["clean", str(docx), "-o", str(dest), "--force-output"], capsys)
+    assert code2 == 0 and dest.read_bytes() == b"CLEAN"
+
+
+def test_clean_residual_exit1(fake_registry, docx, capsys):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover", residual=True)]
+    code, out, _ = run(["clean", str(docx), "--json"], capsys)
+    assert code == 1 and json.loads(out)["verdict"] == "residual"
+
+
+def test_report_is_never_written_into_document(fake_registry, docx, capsys):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    code, _, err = run(["clean", str(docx), "--report", str(docx)], capsys)
+    assert code == 2 and "report" in err
+
+
+def test_no_in_place_flag_exists(capsys, docx):
+    with pytest.raises(SystemExit):
+        cli.main(["clean", str(docx), "--in-place"])
+
+
+def test_detect_does_not_modify_document_dir(fake_registry, docx, capsys):
+    fake_registry["detect"] = [FakeDetect("perlecta", [("high", "x")])]
+    fake_registry["mandatory"] = {"perlecta"}
+    listing = sorted(p.name for p in docx.parent.iterdir())
+    run(["detect", str(docx)], capsys)
+    assert sorted(p.name for p in docx.parent.iterdir()) == listing
+
+
+def test_intent_command_routes_text(capsys):
+    code, out, _ = run(["intent", "revisa y límpialo"], capsys)
+    assert code == 0 and out.strip() == "detect+clean"
+
+
+def test_intent_command_unknown_is_exit2(capsys):
+    code, _, _ = run(["intent", "hola"], capsys)
+    assert code == 2
+
+
+def test_subprocess_env_is_scrubbed_and_offline(tmp_path):
+    import os
+
+    from doc_sentinel.adapters.base import RunContext, run_tool
+    os.environ["WATERMARKS_REWRITE_MODEL"] = "x"
+    os.environ["SOME_SECRET_TOKEN"] = "y"
+    try:
+        ctx = RunContext(workdir=tmp_path, allow_network=False)
+        cp = run_tool(["python3", "-c", "import os,json;print(json.dumps(dict(os.environ)))"], ctx)
+        env = json.loads(cp.stdout)
+    finally:
+        del os.environ["WATERMARKS_REWRITE_MODEL"], os.environ["SOME_SECRET_TOKEN"]
+    assert env["HF_HUB_OFFLINE"] == "1" and env["TRANSFORMERS_OFFLINE"] == "1"
+    assert "WATERMARKS_REWRITE_MODEL" not in env and "SOME_SECRET_TOKEN" not in env
+
+
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare not available")
+def test_detect_subprocess_has_no_network(tmp_path):
+    from doc_sentinel.adapters.base import RunContext, network_sandbox_available, run_tool
+    if not network_sandbox_available():
+        pytest.skip("user namespaces unavailable")
+    ctx = RunContext(workdir=tmp_path, allow_network=False)
+    code = ("import socket,sys\n"
+            "try:\n socket.create_connection(('1.1.1.1',53),timeout=3); print('NET')\n"
+            "except OSError: print('NONET')")
+    cp = run_tool(["python3", "-c", code], ctx)
+    assert cp.stdout.strip() == "NONET"
+
+
+def test_clean_refuses_hardlink_to_input_even_with_force(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    alias = tmp_path / "alias.txt"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["clean", str(docx), "-o", str(alias), "--force-output"], capsys)
+    assert code == 2 and "input" in err
+    assert sha(docx) == before
+
+
+def test_detect_refuses_report_hardlinked_to_input(fake_registry, docx, capsys, tmp_path):
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    alias = tmp_path / "alias.json"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["detect", str(docx), "--report", str(alias)], capsys)
+    assert code == 2 and "report" in err
+    assert sha(docx) == before
+
+
+def test_clean_refuses_report_hardlinked_to_input(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    alias = tmp_path / "alias.json"
+    os.link(docx, alias)
+    before = sha(docx)
+    code, _, err = run(["clean", str(docx), "--report", str(alias)], capsys)
+    assert code == 2 and "report" in err
+    assert sha(docx) == before
+
+
+def test_force_output_replaces_file_without_writing_through_its_inode(
+        fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    dest = tmp_path / "out.txt"
+    dest.write_bytes(b"old")
+    other = tmp_path / "other-name.txt"
+    os.link(dest, other)  # unrelated hardlink to the old output must keep its content
+    code, _, _ = run(["clean", str(docx), "-o", str(dest), "--force-output"], capsys)
+    assert code == 0 and dest.read_bytes() == b"CLEAN" and other.read_bytes() == b"old"
+
+
+def test_run_tool_fails_closed_without_network_isolation(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.delenv("DOC_SENTINEL_NO_NETNS", raising=False)
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="network isolation"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+def _fake_sys_class_net(tmp_path, *names):
+    net = tmp_path / "sys-class-net"
+    net.mkdir()
+    for name in names:
+        (net / name).mkdir()
+    return net
+
+
+def test_run_tool_trusts_declared_external_isolation(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")  # e.g. container with --network=none
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo"))
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    assert base.run_tool(["python3", "-c", "print('ran')"], ctx).stdout.strip() == "ran"
+
+
+def test_declared_isolation_with_real_interfaces_fails_closed(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")  # set, but the process does have network
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo", "eth0"))
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="DOC_SENTINEL_NO_NETNS=1 .*eth0"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+def test_declared_isolation_unverifiable_fails_closed(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")
+    monkeypatch.setattr(base, "SYS_CLASS_NET", tmp_path / "missing")
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    with pytest.raises(base.AdapterError, match="cannot verify"):
+        base.run_tool(["python3", "-c", "print('ran')"], ctx)
+
+
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare not available")
+def test_false_declaration_still_uses_sandbox_when_available(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    if not base.network_sandbox_available():
+        pytest.skip("user namespaces unavailable")
+    monkeypatch.setenv("DOC_SENTINEL_NO_NETNS", "1")
+    monkeypatch.setattr(base, "SYS_CLASS_NET", _fake_sys_class_net(tmp_path, "lo", "eth0"))
+    ctx = base.RunContext(workdir=tmp_path, allow_network=False)
+    child = base.run_tool(["readlink", "/proc/self/ns/net"], ctx).stdout.strip()
+    assert child and child != os.readlink("/proc/self/ns/net")
+
+
+def test_run_tool_allow_network_needs_no_sandbox(monkeypatch, tmp_path):
+    from doc_sentinel.adapters import base
+    monkeypatch.delenv("DOC_SENTINEL_NO_NETNS", raising=False)
+    monkeypatch.setattr(base, "network_sandbox_available", lambda: False)
+    ctx = base.RunContext(workdir=tmp_path, allow_network=True)
+    assert base.run_tool(["python3", "-c", "print('ran')"], ctx).stdout.strip() == "ran"
+
+
+def test_channel_extraction_failure_never_yields_clean(fake_registry, docx, capsys, monkeypatch):
+    from doc_sentinel import pipeline
+
+    def boom(src, dtype):
+        raise ValueError("part exceeds size limit")
+
+    monkeypatch.setattr(pipeline, "extract_channels", boom)
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, out, _ = run(["detect", str(docx), "--json"], capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"]) == (2, "error")
+    assert any(f["id"] == "channel-extract" and "size limit" in f["reason"]
+               for f in data["adapters_failed"])
+
+
+def _rebind(out_dir: Path, target_dir: Path) -> None:
+    """Swap a validated output directory for a symlink to another directory (TOCTOU race)."""
+    out_dir.rename(out_dir.with_name(out_dir.name + "-old"))
+    out_dir.symlink_to(target_dir, target_is_directory=True)
+
+
+class RebindingCleaner(FakeCleaner):
+    def __init__(self, out_dir, target_dir):
+        super().__init__("watermarks-remover")
+        self.out_dir, self.target_dir = out_dir, target_dir
+
+    def clean(self, src, dest, ctx):
+        result = super().clean(src, dest, ctx)
+        _rebind(self.out_dir, self.target_dir)
+        return result
+
+
+class RebindingDetect(FakeDetect):
+    def __init__(self, out_dir, target_dir):
+        super().__init__("perlecta")
+        self.out_dir, self.target_dir = out_dir, target_dir
+
+    def inspect(self, src, ctx):
+        _rebind(self.out_dir, self.target_dir)
+        return []
+
+
+@pytest.fixture
+def raced(tmp_path):
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    src = in_dir / "doc.txt"
+    src.write_text("hola\u200bmundo", encoding="utf-8")
+    return src, in_dir, out_dir
+
+
+def test_clean_output_dir_rebinding_cannot_overwrite_original(fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    fake_registry["clean"] = [RebindingCleaner(out_dir, in_dir)]
+    before = sha(src)
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / "doc.txt")], capsys)
+    assert sha(src) == before
+    assert code == 2
+
+
+def test_detect_report_dir_rebinding_cannot_overwrite_original(fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    fake_registry["detect"] = [RebindingDetect(out_dir, in_dir)]
+    fake_registry["mandatory"] = {"perlecta"}
+    before = sha(src)
+    code, _, _ = run(["detect", str(src), "--report", str(out_dir / "doc.txt")], capsys)
+    assert sha(src) == before
+    assert code == 2
+
+
+def test_clean_output_and_report_are_private_files(fake_registry, docx, capsys, tmp_path):
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    old = os.umask(0o022)
+    try:
+        out, rep = tmp_path / "o.txt", tmp_path / "r.json"
+        code, _, _ = run(["clean", str(docx), "-o", str(out), "--report", str(rep)], capsys)
+    finally:
+        os.umask(old)
+    assert code == 0
+    assert out.stat().st_mode & 0o077 == 0 and rep.stat().st_mode & 0o077 == 0
+
+
+def test_clean_output_dir_rebound_elsewhere_is_refused(fake_registry, raced, capsys, tmp_path):
+    src, _, out_dir = raced
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    fake_registry["clean"] = [RebindingCleaner(out_dir, elsewhere)]
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / "x.txt")], capsys)
+    assert code == 2 and list(elsewhere.iterdir()) == []
+
+
+def test_detect_report_dir_rebound_elsewhere_is_refused(fake_registry, raced, capsys, tmp_path):
+    src, _, out_dir = raced
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    fake_registry["detect"] = [RebindingDetect(out_dir, elsewhere)]
+    fake_registry["mandatory"] = {"perlecta"}
+    code, _, _ = run(["detect", str(src), "--report", str(out_dir / "r.json")], capsys)
+    assert code == 2 and list(elsewhere.iterdir()) == []
+
+
+class MovingInputCleaner(FakeCleaner):
+    """Moves the input's directory away, then rebinds the output dir onto it."""
+
+    def __init__(self, in_dir, out_dir):
+        super().__init__("watermarks-remover")
+        self.in_dir, self.out_dir = in_dir, out_dir
+
+    def clean(self, src, dest, ctx):
+        result = super().clean(src, dest, ctx)
+        saved = self.in_dir.with_name("saved-input")
+        self.in_dir.rename(saved)
+        _rebind(self.out_dir, saved)
+        return result
+
+
+def test_moved_input_dir_cannot_be_overwritten_through_rebound_output(
+        fake_registry, raced, capsys):
+    src, in_dir, out_dir = raced
+    before = sha(src)
+    fake_registry["clean"] = [MovingInputCleaner(in_dir, out_dir)]
+    code, _, _ = run(["clean", str(src), "-o", str(out_dir / src.name)], capsys)
+    saved = in_dir.with_name("saved-input") / src.name
+    assert sha(saved) == before
+    assert code == 2
+
+
+@pytest.mark.parametrize("mode", ["clean", "detect"])
+def test_private_outputs_keep_baseline_permissions(fake_registry, docx, capsys, tmp_path, mode):
+    """S2/S3/S4: writes must not broaden the baseline's private permissions."""
+    fake_registry["clean"] = [FakeCleaner("watermarks-remover")]
+    fake_registry["detect"] = [FakeDetect("perlecta")]
+    fake_registry["mandatory"] = {"perlecta"}
+    docx.chmod(0o600)
+    old_umask = os.umask(0o022)
+    report = tmp_path / "report.json"
+    before = sha(docx)
+    try:
+        code, _, _ = run([mode, str(docx), "--report", str(report)], capsys)
+    finally:
+        os.umask(old_umask)
+    assert code == 0 and sha(docx) == before
+    targets = [report] + ([docx.with_name("in.cleaned.txt")] if mode == "clean" else [])
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in targets)
+
+
+@pytest.mark.parametrize("mode", ["clean-output", "clean-report", "detect-report"])
+@pytest.mark.parametrize("ancestor", [False, True])
+@pytest.mark.parametrize("collision", [False, True])
+def test_rebinding_matrix(fake_registry, tmp_path, capsys, mode, ancestor, collision):
+    """S2/S3/S4: late leaf/ancestor symlinks must be refused, not followed."""
+    inp, out = tmp_path / "in" / "child", tmp_path / "out" / "child"
+    inp.mkdir(parents=True)
+    out.mkdir(parents=True)
+    src = inp / "doc.txt"
+    src.write_bytes(b"ORIGINAL")
+    before = sha(src)
+    changed, target = (out.parent, inp.parent) if ancestor else (out, inp)
+    fake_registry["clean"] = [RebindingCleaner(changed, target)]
+    fake_registry["detect"] = [RebindingDetect(changed, target)]
+    fake_registry["mandatory"] = {"perlecta"}
+    argv = ["detect" if mode == "detect-report" else "clean", str(src)]
+    argv += ["-o" if mode == "clean-output" else "--report",
+             str(out / ("doc.txt" if collision else "unrelated.txt"))]
+    code, _, err = run(argv, capsys)
+    assert sha(src) == before
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert code == 2 and "unsafe write refused" in err
+
+
+@pytest.mark.parametrize("alias", ["same", "hardlink", "symlink"])
+def test_detect_report_alias_preserves_error_text(docx, tmp_path, capsys, alias):
+    before = sha(docx)
+    target = docx if alias == "same" else tmp_path / "alias.txt"
+    if alias == "hardlink":
+        os.link(docx, target)
+    elif alias == "symlink":
+        target.symlink_to(docx)
+    code, out, err = run(["detect", str(docx), "--report", str(target)], capsys)
+    assert code == 2 and out == ""
+    assert err == "doc-sentinel: report path must differ from the input document\n"
+    assert sha(docx) == before
+
+
+@pytest.mark.parametrize("alias", ["same", "hardlink", "symlink"])
+@pytest.mark.parametrize("protected", ["input", "output"])
+def test_clean_report_alias_preserves_exact_error(
+        docx, tmp_path, capsys, alias, protected):
+    output = tmp_path / "output.txt"
+    output.write_bytes(b"KEEP OUTPUT")
+    before = sha(docx), sha(output)
+    original = docx if protected == "input" else output
+    target = original if alias == "same" else tmp_path / "alias.json"
+    if alias == "hardlink":
+        os.link(original, target)
+    elif alias == "symlink":
+        target.symlink_to(original)
+    code, out, err = run(["clean", str(docx), "-o", str(output),
+                          "--force-output", "--report", str(target)], capsys)
+    assert (code, out, err) == (
+        2, "", "doc-sentinel: report path must differ from the input and the output document\n")
+    assert (sha(docx), sha(output)) == before
+
+
+@pytest.fixture
+def phrase_plan(monkeypatch, tmp_path):
+    """Keep real matrix and channel glue; fake only external document/Unicode tools."""
+    real_load = registry.load
+    loaded = []
+
+    def load(adapter_id):
+        loaded.append(adapter_id)
+        if adapter_id in {"unicode-smuggling-guard", "subtext-scan"}:
+            return FakeDetect(adapter_id)
+        return real_load(adapter_id)
+
+    empty_cache = tmp_path / "empty-huggingface"
+    empty_cache.mkdir()
+    monkeypatch.setenv("HF_HOME", str(empty_cache))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setattr(registry, "load", load)
+    return loaded
+
+
+def test_default_txt_improves_previous_missing_model_error(phrase_plan, monkeypatch,
+                                                           tmp_path, capsys):
+    """Pin the old matrix's error/2 against the new default's clean/0."""
+    src = tmp_path / "plain.txt"
+    src.write_text("Ordinary academic text.", encoding="utf-8")
+    before = sha(src)
+    with monkeypatch.context() as legacy:
+        legacy.setitem(registry.DETECT_MATRIX, "txt",
+                       (("unicode-smuggling-guard", "prompt-guard"), ("subtext-scan",)))
+        old_code, old_out, old_err = run(["detect", str(src), "--json"], capsys)
+    old = json.loads(old_out)
+    assert (old_code, old["verdict"]) == (2, "error")
+    assert [a["id"] for a in old["adapters_skipped"]] == ["prompt-guard"]
+    assert old_err
+    phrase_plan.clear()
+    code, out, err = run(["detect", str(src), "--json"], capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"], data["findings"]) == (0, "clean", [])
+    assert "instruction-phrases" in data["adapters_run"]
+    assert "prompt-guard" not in phrase_plan
+    assert all(a["id"] != "prompt-guard" for a in data["adapters_skipped"])
+    assert not data["adapters_failed"] and sha(src) == before
+    assert out.endswith("\n") and err
+
+
+def test_prompt_guard_opt_in_missing_model_skips_without_verdict_change(
+        phrase_plan, tmp_path, capsys):
+    src = tmp_path / "plain.txt"
+    src.write_text("Ordinary academic text.", encoding="utf-8")
+    before = sha(src)
+    base_code, base_out, _ = run(["detect", str(src), "--json"], capsys)
+    code, out, err = run(["detect", str(src), "--json", "--prompt-guard"], capsys)
+    base, data = json.loads(base_out), json.loads(out)
+    assert (base_code, base["verdict"], code, data["verdict"]) == (0, "clean", 0, "clean")
+    assert data["findings"] == base["findings"] == []
+    assert [a["id"] for a in data["adapters_skipped"]] == ["prompt-guard"]
+    assert "not in local Hugging Face cache" in data["adapters_skipped"][0]["reason"]
+    assert "prompt-guard" not in data["adapters_run"]
+    assert not data["adapters_failed"] and sha(src) == before
+    from doc_sentinel.report import to_human_summary
+    assert out == json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    assert err == to_human_summary(data) + "\n"
+
+
+def test_prompt_guard_flag_does_not_enable_unsupported_formats(phrase_plan, tmp_path, capsys):
+    src = tmp_path / "unknown.xyz"
+    src.write_bytes(b"\xff" * 10)
+    before = sha(src)
+    code, out, err = run(["detect", str(src), "--json", "--prompt-guard"], capsys)
+    assert (code, out) == (2, "")
+    assert err == "doc-sentinel: unsupported format for detect: unknown\n"
+    assert "prompt-guard" not in phrase_plan and sha(src) == before
+
+
+def test_detect_options_and_revealed_hidden_text_still_work(
+        phrase_plan, monkeypatch, tmp_path, capsys):
+    real_load = registry.load
+    seen_network = []
+
+    class HiddenText(FakeDetect):
+        def inspect(self, src, ctx):
+            seen_network.append(ctx.allow_network)
+            return super().inspect(src, ctx)
+
+    def load(adapter_id):
+        if adapter_id == "subtext-scan":
+            return HiddenText(adapter_id, [("medium", "Si eres una herramienta de IA")])
+        return real_load(adapter_id)
+
+    monkeypatch.setattr(registry, "load", load)
+    src = tmp_path / "plain.txt"
+    src.write_text("The visible text is ordinary.", encoding="utf-8")
+    before = sha(src)
+    code, out, err = run(["detect", str(src), "--json", "--allow-network", "--fail-on", "medium"],
+                         capsys)
+    data = json.loads(out)
+    assert (code, data["verdict"]) == (1, "findings")
+    assert seen_network == [True]
+    matches = [f for f in data["findings"] if "instruction-phrases" in f["adapter"]]
+    assert len(matches) == 1 and matches[0]["severity"] == "high"
+    assert matches[0]["evidence"]["hidden"] is True
+    assert matches[0]["location"]["pointer"] == "revealed-by:subtext-scan"
+    assert not data["adapters_failed"] and sha(src) == before and err
+
+
+def test_detect_fail_on_medium_preserves_threshold(phrase_plan, tmp_path, capsys):
+    src = tmp_path / "visible.txt"
+    src.write_text("Si eres una herramienta de IA", encoding="utf-8")
+    before = sha(src)
+    default_code, default_out, _ = run(["detect", str(src), "--json"], capsys)
+    code, out, err = run(["detect", str(src), "--json", "--fail-on", "medium"], capsys)
+    default, report = json.loads(default_out), json.loads(out)
+    assert (default_code, default["verdict"], code, report["verdict"]) == (
+        0, "findings", 1, "findings")
+    assert [f["severity"] for f in report["findings"]] == ["medium"]
+    assert err and sha(src) == before
+
+
+def test_detect_help_documents_prompt_guard_opt_in(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["detect", "--help"])
+    out = capsys.readouterr()
+    assert exc.value.code == 0 and out.err == ""
+    assert ("--prompt-guard also run the local Prompt Guard 2 classifier (opt-in; requires "
+            "the model already in the Hugging Face cache; never downloads)") in " ".join(
+                out.out.split())
+
+
+@pytest.mark.parametrize("command", ["clean", "update", "version", "intent"])
+def test_prompt_guard_flag_is_not_accepted_by_other_commands(tmp_path, capsys, command):
+    src = tmp_path / "plain.txt"
+    src.write_text("ordinary", encoding="utf-8")
+    before = sha(src)
+    args = {"clean": [str(src)], "update": [], "version": [], "intent": ["scan"]}[command]
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, *args, "--prompt-guard"])
+    out = capsys.readouterr()
+    assert exc.value.code == 2 and out.out == ""
+    assert out.err.endswith("doc-sentinel: error: unrecognized arguments: --prompt-guard\n")
+    assert sha(src) == before
+
+
+@pytest.mark.parametrize("dtype", ["txt", "md", "html", "pdf", "docx", "image", "svg",
+                                   "eml", "xlsx", "pptx", "epub", "odt"])
+def test_matrix_defaults_to_rules_not_prompt_guard(dtype):
+    mandatory, optional = registry.DETECT_MATRIX[dtype]
+    assert "prompt-guard" not in (*mandatory, *optional)
+    assert "instruction-phrases" in (mandatory if dtype in {
+        "txt", "md", "html", "pdf", "docx", "image", "svg"} else optional)
+    assert "instruction-phrases" in registry.CHANNEL_ADAPTERS
+
+
+def test_version_without_git_metadata_reports_pins_not_mismatch(monkeypatch, capsys):
+    from doc_sentinel import cli as cli_module
+    monkeypatch.setattr(cli_module, "checkout_sha", lambda root, path: None)
+    code, out, _ = run(["version"], capsys)
+    assert code == 0
+    assert "MISMATCH" not in out
+    assert "pinned (no git checkout to compare)" in out
+
+
+def test_child_env_routes_pymupdf_messages_to_stderr(tmp_path):
+    # PyMuPDF 1.x prints a 'fitz API is deprecated' warning on stdout when a sub-harness
+    # imports fitz; that line corrupted hidden-text-detector's JSON report.
+    from doc_sentinel.adapters.base import RunContext, child_env
+    env = child_env(RunContext(workdir=tmp_path))
+    assert env["PYMUPDF_MESSAGE"] == "fd:2"
+
+
+def test_fitz_import_in_child_keeps_stdout_clean(tmp_path):
+    pytest.importorskip("pymupdf")
+    import sys
+
+    from doc_sentinel.adapters.base import RunContext, run_tool
+    ctx = RunContext(workdir=tmp_path, allow_network=True)
+    proc = run_tool([sys.executable, "-c", "import fitz, json; print(json.dumps({'ok': 1}))"], ctx)
+    assert proc.stdout.strip() == '{"ok": 1}'
+
+
+def test_in_process_pymupdf_never_writes_to_stdout(tmp_path, capfd):
+    # PyMuPDF 1.x prints a 'pymupdf_layout' recommendation on stdout from find_tables();
+    # in-process use must keep stdout clean for --json / --agent-summary output.
+    pytest.importorskip("pymupdf")
+    from doc_sentinel._pymupdf import load
+
+    pymupdf = load()
+    pdf = tmp_path / "t.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Cell A    Cell B")
+    doc.save(pdf)
+    doc.close()
+    capfd.readouterr()
+    with load().open(pdf) as reopened:
+        reopened[0].find_tables()
+        reopened[0].get_text("dict", sort=True)
+    assert capfd.readouterr().out == ""

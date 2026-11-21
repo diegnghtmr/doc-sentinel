@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: LibreOffice for sanitize render checks (same fonts as the image)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui fonts-dejavu-core fonts-liberation2 fonts-crosextra-carlito fonts-crosextra-caladea
+      - name: Allow unprivileged user namespaces (detect sandbox uses unshare -rn)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: pip install -e '.[dev,clean]'
+      - run: ruff check src tests
+      - name: Unit tests (integration tests skip without sub-harness deps)
+        run: pytest -q -m "not integration"
+
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - name: pins.lock.json matches submodule gitlinks
+        run: pytest -q tests/test_pins.py
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa qpdf poppler-utils libreoffice-writer-nogui fonts-dejavu-core fonts-liberation2 fonts-crosextra-carlito fonts-crosextra-caladea
+      - name: Allow unprivileged user namespaces (detect sandbox uses unshare -rn)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: |
+          pip install uv
+          uv pip install --system \
+            -e '.[dev,clean,detect]' -e 'third_party/perlecta-mcp[rendu]' \
+            -e third_party/unicode-smuggling-guard
+          (cd third_party/subtext-scan && npm ci --ignore-scripts)
+          CARGO_TARGET_DIR=.cache/cargo cargo build --release --manifest-path third_party/chk_defaced-rs/Cargo.toml
+          mkdir -p bin && cp .cache/cargo/release/chk_defaced bin/
+      - name: Full corpus (no model; Prompt Guard opt-in tests skip)
+        run: pytest -q
+
+  detect-offline:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: docker build -f containers/Dockerfile -t doc-sentinel:local .
+      - name: detect and clean in the hardened offline image
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          mkdir "$scratch/in" "$scratch/out" "$scratch/report"
+          chmod 755 "$scratch/in"
+          chmod 777 "$scratch/out" "$scratch/report"
+          printf 'hola\xe2\x80\x8bmundo\n' > "$scratch/in/z.txt"
+          original=$(sha256sum "$scratch/in/z.txt" | cut -d ' ' -f 1)
+          set +e
+          docker run --rm --network=none --read-only --tmpfs /tmp --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 10001:10001 -e DOC_SENTINEL_NO_NETNS=1 \
+            -v "$scratch/in:/work/in:ro" -v "$scratch/out:/work/out:rw" \
+            -v "$scratch/report:/work/report:rw" doc-sentinel:local \
+            detect /work/in/z.txt --json --report /work/report/detect.json > "$scratch/detect.json"
+          code=$?
+          set -e
+          python3 - "$code" "$scratch/detect.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[2]))
+          assert d["verdict"] != "clean", d["verdict"]
+          assert "unicode-smuggling-guard" in d["adapters_run"], d["adapters_run"]
+          assert any(f["class"] == "unicode_smuggling" for f in d["findings"]), d["findings"]
+          assert not d["adapters_failed"] and not d["adapters_skipped"], d
+          assert sys.argv[1] == "0", sys.argv[1]
+          print("exit", sys.argv[1], "verdict", d["verdict"])
+          PY
+          docker run --rm --network=none --read-only --tmpfs /tmp --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 10001:10001 -e DOC_SENTINEL_NO_NETNS=1 \
+            -v "$scratch/in:/work/in:ro" -v "$scratch/out:/work/out:rw" \
+            -v "$scratch/report:/work/report:rw" doc-sentinel:local \
+            clean /work/in/z.txt -o /work/out/z.cleaned.txt --json \
+            --report /work/report/clean.json > "$scratch/clean.json"
+          python3 - "$scratch/clean.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          assert d["verdict"] == "cleaned" and not d["adapters_failed"], d
+          PY
+          # The output is private (0600), so inspect it as the same container UID.
+          docker run --rm --network=none --read-only --tmpfs /tmp --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 10001:10001 -e DOC_SENTINEL_NO_NETNS=1 \
+            -v "$scratch/out:/work/out:ro" --entrypoint python doc-sentinel:local \
+            -c 'from pathlib import Path; assert Path("/work/out/z.cleaned.txt").read_text() == "holamundo\n"'
+          test "$original" = "$(sha256sum "$scratch/in/z.txt" | cut -d ' ' -f 1)"

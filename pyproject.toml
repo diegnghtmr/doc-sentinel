@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc-sentinel"
+version = "0.1.0"
+description = "Meta-harness that cleans deterministic AI-tool traces and detects prompt injection in documents by orchestrating pinned third-party sub-harnesses."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+# PDF cleaning verifies and, without exiftool, rewrites AI metadata in the output copy.
+clean = [
+    "pikepdf>=8",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
+]
+# Runtime deps of the pinned sub-harnesses that run as child processes in this venv.
+detect = [
+    "pikepdf>=8",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
+    "python-docx>=1.1",
+    "numpy>=1.24",
+    "pytesseract>=0.3",
+]
+promptguard = [
+    "torch>=2.4.1",
+    "transformers>=4.51.3",
+    "huggingface_hub>=0.30.2",
+]
+dev = [
+    "pikepdf>=8",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
+    "pytest>=8",
+    "ruff>=0.5",
+    "reportlab>=4",
+    "python-docx>=1.1",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+doc-sentinel = "doc_sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs installed sub-harnesses (third_party + venv deps)",
+    "network: needs network access",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
