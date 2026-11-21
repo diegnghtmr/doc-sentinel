@@ -103,7 +103,13 @@ def _version() -> int:
         return 0
     for pin in lock.get("pins", []):
         actual = checkout_sha(root, pin["path"])
-        state = "ok" if actual == pin["sha"] else f"MISMATCH checkout={actual}"
+        if actual is None:
+            # Container images and source archives carry no .git metadata to compare.
+            state = "pinned (no git checkout to compare)"
+        elif actual == pin["sha"]:
+            state = "ok"
+        else:
+            state = f"MISMATCH checkout={actual}"
         print(f"  {pin['id']:<26} {pin['sha'][:12]}  {state}")
     return 0
 

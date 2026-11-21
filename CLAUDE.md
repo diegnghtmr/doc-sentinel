@@ -1,8 +1,8 @@
 # CLAUDE.md — doc-sentinel
 
-Lee y cumple **[AGENTS.md](./AGENTS.md)**. Este archivo solo añade notas de Claude Code.
+Read and follow [AGENTS.md](./AGENTS.md); it is the canonical operating contract.
 
-- El router de intenciones y los comandos canónicos están en AGENTS.md (modos `clean`, `detect`, `update`).
-- No instales MCP de Perlecta o subtext-scan «por tu cuenta» para saltarte `doc-sentinel`. Si el usuario ya tiene esos MCP, sigue usándolos solo como lectura auxiliar; el veredicto lo da `doc-sentinel`.
-- No ejecutes Skill de watermarks-remover que dispare Layer B o el HTTP `/clean` de texto.
-- Al añadir el proyecto: `git submodule update --init --recursive` y comprobar `doc-sentinel version`.
+For Claude Code, use the `doc-sentinel-reviewer` subagent via the Task/Agent tool
+only when the isolation and consent requirements in AGENTS.md are met. A `Read`
+tool allowlist does not confine paths. As the orchestrator, never use Read on inbox
+files, reports, review plans, batch files, reviewer answers, or the input document.

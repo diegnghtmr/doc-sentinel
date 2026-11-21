@@ -1,0 +1,265 @@
+"""S12 launcher contract, exercised against a recording Docker executable."""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+IMAGE = "doc-sentinel:local"
+UPDATE_ERROR = "update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)"
+NETWORK_ERROR = "--allow-network is not available in the container launcher"
+OUTPUT_ERROR = "output path must differ from the input (no in-place cleaning)"
+REPORT_CLEAN_ERROR = "report path must differ from the input and the output document"
+REPORT_DETECT_ERROR = "report path must differ from the input document"
+
+
+class Harness:
+    def __init__(self, root, backend="sh"):
+        self.root = root
+        self.backend = backend
+        self.repo = root / "repo"
+        self.scripts = self.repo / "scripts"
+        self.scripts.mkdir(parents=True)
+        name = "doc-sentinel-docker.sh" if backend == "sh" else "doc-sentinel.ps1"
+        source = ROOT / "scripts" / name
+        if source.exists():
+            shutil.copyfile(source, self.scripts / name)
+        (self.repo / "containers").mkdir()
+        (self.repo / "containers" / "Dockerfile").write_text("# build fixture\n")
+        (self.repo / "third_party" / "one").mkdir(parents=True)
+        (self.repo / "third_party" / "one" / "source").write_text("fixture\n")
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        if backend == "sh":
+            # Never fall through to a real Docker CLI, including the missing-Docker case.
+            for tool in ("dirname", "basename", "realpath", "uname", "id"):
+                (self.bin / tool).symlink_to(shutil.which(tool))
+        fake = ROOT / "tests" / "launchers" / ("fake-docker.py" if backend == "sh" else "fake-docker.ps1")
+        shutil.copyfile(fake, self.bin / "docker")
+        (self.bin / "docker").chmod(0o755)
+        self.input_dir = root / "input docs"
+        self.output_dir = root / "output docs"
+        self.report_dir = root / "reports here"
+        for directory in (self.input_dir, self.output_dir, self.report_dir):
+            directory.mkdir()
+        self.input = self.input_dir / "informe final.docx"
+        self.input.write_bytes(b"synthetic input, unchanged")
+        self.log = root / "calls.jsonl"
+        self.config = {}
+
+    def path(self, path):
+        path = Path(path)
+        if self.backend == "pwsh":
+            return str(Path("/case") / path.relative_to(self.root))
+        return str(path)
+
+    def run(self, *args):
+        env = {"PATH": str(self.bin), "LANG": "C.UTF-8",
+               "FAKE_LOG": str(self.log), **self.config}
+        args = [self.path(a) if isinstance(a, Path) else str(a) for a in args]
+        if self.backend == "sh":
+            cmd = ["/bin/sh", str(self.scripts / "doc-sentinel-docker.sh"), *args]
+        else:
+            pytest.fail("PowerShell harness must override run")
+        return subprocess.run(cmd, cwd=self.root, env=env, text=True, capture_output=True, check=False)
+
+    def calls(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8-sig").splitlines()]
+
+    def calls_named(self, name):
+        return [call["args"] for call in self.calls() if call["args"][:1] == [name]]
+
+    def run_args(self):
+        calls = self.calls_named("run")
+        assert len(calls) == 1
+        return calls[0]
+
+    def assert_base(self, run, mounts):
+        assert run[:9] == ["run", "--rm", "--network=none", "--read-only", "--tmpfs",
+                           "/tmp:rw,nosuid,nodev,size=1g", "--cap-drop=ALL",
+                           "--security-opt=no-new-privileges", "-e"]
+        assert run[9] == "DOC_SENTINEL_NO_NETNS=1"
+        if self.backend == "pwsh" or platform.system() == "Linux":
+            assert run[10:12] == ["--user", f"{os.getuid()}:{os.getgid()}" if self.backend == "sh" else "0:0"]
+            pos = 12
+        else:
+            pos = 10
+        for host_dir, target, mode in mounts:
+            assert run[pos:pos + 2] == ["-v", f"{self.path(host_dir)}:{target}:{mode}"]
+            pos += 2
+        assert run[pos] == IMAGE
+        return run[pos + 1:]
+
+
+@pytest.fixture
+def harness():
+    with tempfile.TemporaryDirectory(prefix="doc-sentinel-launchers-") as directory:
+        yield Harness(Path(directory) / "case with spaces")
+
+
+class LauncherScenarios:
+    def test_clean_default_output_and_paths_with_spaces(self, harness):
+        result = harness.run("clean", harness.input, "--json")
+        output = harness.input_dir / "informe final.cleaned.docx"
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "", f"Cleaned copy: {harness.path(output)}\n")
+        args = harness.assert_base(harness.run_args(), [
+            (harness.input_dir, "/work/in", "ro"), (harness.input_dir, "/work/out", "rw")])
+        assert args == ["clean", "/work/in/informe final.docx", "-o",
+                        "/work/out/informe final.cleaned.docx", "--json"]
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    def test_clean_custom_output_and_separate_report(self, harness):
+        output = harness.output_dir / "clean copy.docx"
+        report = harness.report_dir / "audit report.json"
+        result = harness.run("clean", harness.input, "--output", output, "--force-output",
+                             "--json", "--report", report)
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0, "", f"Cleaned copy: {harness.path(output)}\n")
+        args = harness.assert_base(harness.run_args(), [
+            (harness.input_dir, "/work/in", "ro"), (harness.output_dir, "/work/out", "rw"),
+            (harness.report_dir, "/work/report", "rw")])
+        assert args == ["clean", "/work/in/informe final.docx", "-o", "/work/out/clean copy.docx",
+                        "--force-output", "--json", "--report", "/work/report/audit report.json"]
+
+    def test_clean_report_reuses_output_mount(self, harness):
+        output = harness.output_dir / "copy.docx"
+        report = harness.output_dir / "report.json"
+        result = harness.run("clean", harness.input, "-o", output, "--report", report)
+        assert result.returncode == 0
+        args = harness.assert_base(harness.run_args(), [
+            (harness.input_dir, "/work/in", "ro"), (harness.output_dir, "/work/out", "rw")])
+        assert args == ["clean", "/work/in/informe final.docx", "-o", "/work/out/copy.docx",
+                        "--report", "/work/out/report.json"]
+
+    def test_detect_with_all_supported_options(self, harness):
+        report = harness.report_dir / "report.json"
+        result = harness.run("detect", harness.input, "--json", "--report", report,
+                             "--fail-on", "medium", "--prompt-guard")
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        args = harness.assert_base(harness.run_args(), [
+            (harness.input_dir, "/work/in", "ro"), (harness.report_dir, "/work/report", "rw")])
+        assert args == ["detect", "/work/in/informe final.docx", "--json", "--report",
+                        "/work/report/report.json", "--fail-on", "medium", "--prompt-guard"]
+
+    @pytest.mark.parametrize("args", [("version",), ("intent", "revisa y límpialo")])
+    def test_version_and_intent_pass_through(self, harness, args):
+        harness.config.update(FAKE_RUN_STDOUT="answer\n", FAKE_RUN_STDERR="detail\n")
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "answer\n", "detail\n")
+        assert harness.assert_base(harness.run_args(), []) == list(args)
+
+    def test_nonzero_exit_and_streams_are_unchanged(self, harness):
+        harness.config.update(FAKE_RUN_CODE="1", FAKE_RUN_STDOUT="findings\n", FAKE_RUN_STDERR="warning\n")
+        result = harness.run("detect", harness.input)
+        assert (result.returncode, result.stdout, result.stderr) == (1, "findings\n", "warning\n")
+        assert harness.calls_named("run")
+
+    def test_passthrough_without_trailing_newline(self, harness):
+        harness.config.update(FAKE_RUN_CODE="1", FAKE_RUN_STDOUT="no newline", FAKE_RUN_STDERR="warning")
+        result = harness.run("detect", harness.input)
+        assert (result.returncode, result.stdout, result.stderr) == (1, "no newline", "warning")
+        assert harness.calls_named("run")
+
+    def test_clean_nonzero_has_no_success_note(self, harness):
+        harness.config.update(FAKE_RUN_CODE="1", FAKE_RUN_STDOUT="residual\n", FAKE_RUN_STDERR="detail\n")
+        result = harness.run("clean", harness.input)
+        assert (result.returncode, result.stdout, result.stderr) == (1, "residual\n", "detail\n")
+
+    @pytest.mark.parametrize("case", ["update", "network", "output_input", "report_input_clean",
+                                      "report_input_detect", "report_output", "missing_input"])
+    def test_refusals_do_not_invoke_docker_or_modify_input(self, harness, case):
+        output = harness.output_dir / "output.docx"
+        args, message = {
+            "update": (["update"], UPDATE_ERROR),
+            "network": (["detect", harness.input, "--allow-network"], NETWORK_ERROR),
+            "output_input": (["clean", harness.input, "-o", harness.input], OUTPUT_ERROR),
+            "report_input_clean": (["clean", harness.input, "--report", harness.input], REPORT_CLEAN_ERROR),
+            "report_input_detect": (["detect", harness.input, "--report", harness.input], REPORT_DETECT_ERROR),
+            "report_output": (["clean", harness.input, "-o", output, "--report", output], REPORT_CLEAN_ERROR),
+            "missing_input": (["detect", harness.input_dir / "missing.docx"],
+                              f"input not found: {harness.path(harness.input_dir / 'missing.docx')}"),
+        }[case]
+        before = harness.input.read_bytes()
+        result = harness.run(*args)
+        assert (result.returncode, result.stdout, result.stderr) == (2, "", message + "\n")
+        assert harness.input.read_bytes() == before
+        assert not output.exists()
+        assert harness.calls() == []
+
+    def test_refuse_aliased_input(self, harness):
+        alias = harness.input_dir / "alias.docx"
+        alias.symlink_to(harness.input.name)
+        result = harness.run("clean", harness.input, "-o", alias)
+        assert (result.returncode, result.stdout, result.stderr) == (2, "", OUTPUT_ERROR + "\n")
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+        assert harness.calls() == []
+
+    def test_missing_docker(self, harness):
+        (harness.bin / "docker").unlink()
+        result = harness.run("version")
+        assert (result.returncode, result.stdout, result.stderr) == (
+            2, "", "docker is not installed or not on PATH\n")
+        assert harness.calls() == []
+
+    def test_daemon_down(self, harness):
+        harness.config["FAKE_INFO_CODE"] = "1"
+        result = harness.run("version")
+        assert (result.returncode, result.stdout, result.stderr) == (
+            2, "", "Docker daemon is not available\n")
+        assert len(harness.calls_named("info")) == 1
+        assert harness.calls_named("run") == []
+
+    def test_missing_image_builds_from_repo(self, harness):
+        harness.config["FAKE_IMAGE_CODE"] = "1"
+        result = harness.run("version")
+        assert (result.returncode, result.stdout) == (0, "")
+        assert "build stdout\n" in result.stderr and "build stderr\n" in result.stderr
+        assert harness.calls_named("build") == [["build", "-f", harness.path(harness.repo / "containers" / "Dockerfile"),
+                                                  "-t", IMAGE, harness.path(harness.repo)]]
+        assert harness.calls_named("run")
+
+    def test_missing_submodule_refuses_build(self, harness):
+        (harness.repo / "third_party" / "one" / "source").unlink()
+        harness.config["FAKE_IMAGE_CODE"] = "1"
+        result = harness.run("version")
+        assert (result.returncode, result.stdout, result.stderr) == (
+            2, "", "run: git submodule update --init --recursive\n")
+        assert harness.calls_named("build") == [] and harness.calls_named("run") == []
+
+    def test_build_failure_is_propagated_without_running(self, harness):
+        harness.config.update(FAKE_IMAGE_CODE="1", FAKE_BUILD_CODE="7")
+        result = harness.run("version")
+        assert result.returncode == 7 and result.stdout == ""
+        assert "build stdout\n" in result.stderr and "build stderr\n" in result.stderr
+        assert not harness.calls_named("run")
+
+    def test_help_and_no_args(self, harness):
+        help_result = harness.run("--help")
+        assert help_result.returncode == 0 and "usage:" in help_result.stdout.lower() and not help_result.stderr
+        no_args = harness.run()
+        assert no_args.returncode == 2 and "usage:" in no_args.stdout.lower() and not no_args.stderr
+        assert not harness.calls()
+
+    @pytest.mark.parametrize("args", [("detect", "--bogus"), ("clean",),
+                                      ("detect", "--fail-on", "critical")])
+    def test_bad_arguments_are_rejected(self, harness, args):
+        result = harness.run(*args)
+        assert result.returncode == 2 and result.stdout == "" and result.stderr
+        assert not harness.calls_named("run")
+
+
+class TestShLauncher(LauncherScenarios):
+    def test_rebuild_switch(self, harness):
+        result = harness.run("--rebuild", "version")
+        assert result.returncode == 0
+        assert len(harness.calls_named("build")) == 1
