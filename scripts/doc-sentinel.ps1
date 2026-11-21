@@ -62,9 +62,10 @@ function New-DockerRunArguments(
 function Write-LauncherError([string]$Message) { [Console]::Error.WriteLine($Message) }
 function Show-Usage {
     @(
-        'usage: doc-sentinel.ps1 [-Rebuild] [-StartTimeoutSeconds N] {clean,detect,review-merge,version,intent} ...'
+        'usage: doc-sentinel.ps1 [-Rebuild] [-StartTimeoutSeconds N] {clean,detect,sanitize,review-merge,version,intent} ...'
         '  clean FILE [-o PATH] [--force-output] [--json|--agent-summary] [--report PATH]'
-        '  detect FILE [--json|--agent-summary] [--report PATH] [--review-dir DIR]'
+        '  detect FILE [--sanitize [-o PATH] [--force-output]] [--agent-summary] [--review-dir DIR]'
+        '  sanitize FILE --review-dir DIR [-o PATH] [--force-output] [--report PATH] [--agent-summary]'
         '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'
         '  version | intent TEXT...'
         '  update and --allow-network require the Python CLI on the host.'
@@ -183,12 +184,12 @@ function Invoke-Launcher([string[]]$Arguments) {
     if ($mode -eq 'update') {
         Write-LauncherError 'update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)'; return 2
     }
-    if (@('clean', 'detect', 'review-merge', 'version', 'intent') -cnotcontains $mode) {
+    if (@('clean', 'detect', 'sanitize', 'review-merge', 'version', 'intent') -cnotcontains $mode) {
         Write-LauncherError "unknown command: $mode"; return 2
     }
     $inputPath = ''; $outputPath = ''; $reportPath = ''; $reviewPath = ''; $json = $false; $agent = $false
-    $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @()
-    if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'review-merge') {
+    $force = $false; $promptGuard = $false; $failOn = ''; $passthrough = @(); $sanitized = $mode -eq 'sanitize'
+    if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'sanitize' -or $mode -eq 'review-merge') {
         while ($index -lt $Arguments.Count) {
             $arg = $Arguments[$index]; $index++
             if ($arg -eq '-h' -or $arg -eq '--help') { Show-Usage; return 0 }
@@ -199,13 +200,13 @@ function Invoke-Launcher([string[]]$Arguments) {
                 if ($index -ge $Arguments.Count -or -not $Arguments[$index]) { Write-LauncherError "missing value for $arg"; return 2 }
                 $value = $Arguments[$index]; $index++
                 if ($arg -eq '-o' -or $arg -eq '--output') {
-                    if ($mode -ne 'clean') { Write-LauncherError "unknown option: $arg"; return 2 }; $outputPath = $value
+                    if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }; $outputPath = $value
                 } elseif ($arg -eq '--report') { $reportPath = $value }
                 elseif ($arg -eq '--review-dir') {
                     if ($mode -eq 'clean') { Write-LauncherError "unknown option: $arg"; return 2 }; $reviewPath = $value
                 } else { if ($mode -ne 'detect') { Write-LauncherError "unknown option: $arg"; return 2 }; $failOn = $value }
             } elseif ($arg.StartsWith('--output=') -or ($arg.StartsWith('-o') -and $arg.Length -gt 2)) {
-                if ($mode -ne 'clean') { Write-LauncherError "unknown option: $arg"; return 2 }
+                if ($mode -eq 'review-merge') { Write-LauncherError "unknown option: $arg"; return 2 }
                 if ($arg.StartsWith('--output=')) { $outputPath = $arg.Substring(9) } else { $outputPath = $arg.Substring(2) }
                 if (-not $outputPath) { Write-LauncherError 'missing value for --output'; return 2 }
             } elseif ($arg.StartsWith('--report=')) {
@@ -216,9 +217,10 @@ function Invoke-Launcher([string[]]$Arguments) {
             } elseif ($arg.StartsWith('--fail-on=')) {
                 if ($mode -ne 'detect') { Write-LauncherError "unknown option: $arg"; return 2 }
                 $failOn = $arg.Substring(10); if (-not $failOn) { Write-LauncherError 'missing value for --fail-on'; return 2 }
-            } elseif ($arg -eq '--json' -and $mode -ne 'review-merge') { $json = $true }
+            } elseif ($arg -eq '--json' -and ($mode -eq 'clean' -or $mode -eq 'detect')) { $json = $true }
             elseif ($arg -eq '--agent-summary') { $agent = $true }
-            elseif ($arg -eq '--force-output' -and $mode -eq 'clean') { $force = $true }
+            elseif ($arg -eq '--sanitize' -and $mode -eq 'detect') { $sanitized = $true }
+            elseif ($arg -eq '--force-output' -and $mode -ne 'review-merge') { $force = $true }
             elseif ($arg -eq '--prompt-guard' -and $mode -eq 'detect') { $promptGuard = $true }
             elseif ($arg -eq '--') {
                 if ($index -ne $Arguments.Count - 1 -or $inputPath) { Write-LauncherError 'expected exactly one input file'; return 2 }
@@ -230,6 +232,10 @@ function Invoke-Launcher([string[]]$Arguments) {
             }
         }
         if ($json -and $agent) { Write-LauncherError '--json and --agent-summary are mutually exclusive'; return 2 }
+        if ($mode -eq 'detect' -and -not $sanitized -and ($outputPath -or $force)) {
+            Write-LauncherError '--output and --force-output require --sanitize'; return 2
+        }
+        if ($mode -eq 'sanitize' -and -not $reviewPath) { Write-LauncherError 'sanitize requires --review-dir'; return 2 }
         if ($failOn -and @('high', 'medium') -cnotcontains $failOn) { Write-LauncherError 'invalid --fail-on value (choose high or medium)'; return 2 }
         if ($mode -ne 'review-merge') {
             if (-not $inputPath) { Write-LauncherError 'expected an input file'; return 2 }
@@ -256,12 +262,13 @@ function Invoke-Launcher([string[]]$Arguments) {
                 Write-LauncherError 'review directory does not exist'; return 2
             }
         }
-        if ($mode -eq 'clean') {
+        if ($mode -eq 'clean' -or $sanitized) {
             if (-not $outputPath) {
                 $extension = [IO.Path]::GetExtension($inName)
                 if ($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) { $extension = '' }
                 $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
-                $outputPath = Join-Path $inDir "$stem.cleaned$extension"
+                $suffix = if ($sanitized) { 'sanitized' } else { 'cleaned' }
+                $outputPath = Join-Path $inDir "$stem.$suffix$extension"
             }
             try { $outputPath = Resolve-HostPath $outputPath }
             catch { Write-LauncherError 'output directory does not exist'; return 2 }
@@ -274,7 +281,7 @@ function Invoke-Launcher([string[]]$Arguments) {
             try { $reportPath = Resolve-HostPath $reportPath }
             catch { Write-LauncherError 'report directory does not exist'; return 2 }
             $reportIsInput = $inputPath -and (Test-SamePath -First $reportPath -Second $inputPath -Windows $windowsHost)
-            if ($mode -eq 'clean') {
+            if ($mode -eq 'clean' -or $sanitized) {
                 if ($reportIsInput -or (Test-SamePath -First $reportPath -Second $outputPath -Windows $windowsHost)) {
                     Write-LauncherError 'report path must differ from the input and the output document'; return 2
                 }
@@ -299,14 +306,14 @@ function Invoke-Launcher([string[]]$Arguments) {
     $hostIsLinux = -not $windowsHost -and (& uname -s) -eq 'Linux'
     $user = if ($hostIsLinux) { "$(id -u):$(id -g)" } else { '' }
     $inputDirectory = ''; $outputDirectory = ''; $reportDirectory = ''; $displayEnvironment = @()
-    if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'review-merge') {
+    if ($mode -eq 'clean' -or $mode -eq 'detect' -or $mode -eq 'sanitize' -or $mode -eq 'review-merge') {
         if ($mode -ne 'review-merge') { $inputDirectory = $inDir }
-        if ($mode -eq 'clean') { $outputDirectory = $outDir }
+        if ($mode -eq 'clean' -or $sanitized) { $outputDirectory = $outDir }
         if ($reportPath) { $reportDirectory = $reportDir }
-        $sharedReportDir = $mode -eq 'clean' -and $reportPath -and (Test-SamePath -First $reportDir -Second $outDir -Windows $windowsHost)
+        $sharedReportDir = ($mode -eq 'clean' -or $sanitized) -and $reportPath -and (Test-SamePath -First $reportDir -Second $outDir -Windows $windowsHost)
         $containerArgs = @('doc-sentinel:local', $mode)
         if ($mode -ne 'review-merge') { $containerArgs += "/work/in/$inName" }
-        if ($mode -eq 'clean') { $containerArgs += @('-o', "/work/out/$outName"); if ($force) { $containerArgs += '--force-output' } }
+        if ($mode -eq 'clean' -or $sanitized) { $containerArgs += @('-o', "/work/out/$outName"); if ($force) { $containerArgs += '--force-output' } }
         if ($json) { $containerArgs += '--json' }
         if ($agent) { $containerArgs += '--agent-summary' }
         if ($reportPath) {
@@ -316,6 +323,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         if ($failOn) { $containerArgs += @('--fail-on', $failOn) }
         if ($promptGuard) { $containerArgs += '--prompt-guard' }
         if ($reviewPath) { $containerArgs += @('--review-dir', '/work/review') }
+        if ($mode -eq 'detect' -and $sanitized) { $containerArgs += '--sanitize' }
         if ($agent) {
             if ($inputPath) { $displayEnvironment += "DOC_SENTINEL_HOST_INPUT=$inputDisplay" }
             if ($outputPath) { $displayEnvironment += "DOC_SENTINEL_HOST_OUTPUT=$outputPath" }

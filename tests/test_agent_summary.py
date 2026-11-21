@@ -41,6 +41,12 @@ def test_safe_summary_never_copies_hostile_report_strings(monkeypatch, scratch, 
         "adapters_failed": [{"id": "subtext-scan", "reason": hostile}],
         "findings": [finding], "verdict": "findings", "c2pa": {"actions": [hostile]},
         "output_path": hostile, "warnings": [hostile], "clean_actions": [{"what": hostile}],
+        "sanitize": {"status": "refused", "output_path": hostile, "refusal_reason": hostile,
+                     "actions": [{"technique": "tracked_deletion", "visibility": "hidden",
+                                  "part": hostile, "location": hostile, "reason": hostile,
+                                  "removed_text": hostile},
+                                 {"technique": hostile, "visibility": hostile,
+                                  "removed_text": hostile}]},
     }
     monkeypatch.setattr(cli, "run_detect", lambda *args, **kwargs: (report, 1))
     code = cli.main(["detect", str(src), "--agent-summary"])
@@ -57,6 +63,11 @@ def test_safe_summary_never_copies_hostile_report_strings(monkeypatch, scratch, 
                                 "failed": ["subtext-scan"]}
     assert data["output_path"] is None and data["report_path"] is None
     assert data["review"] is None and data["review_errors"] == []
+    assert data["sanitize"] == {
+        "status": "refused", "output_path": None,
+        "refusal_reason": "sanitization could not be completed safely",
+        "counts": {"technique": {"tracked_deletion": 1}, "visibility": {"hidden": 1}},
+    }
 
 
 def test_clean_agent_summary_uses_only_caller_paths(monkeypatch, scratch, capsys):

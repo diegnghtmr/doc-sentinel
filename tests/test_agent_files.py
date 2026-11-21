@@ -120,23 +120,20 @@ def test_reviewer_contract_has_exact_answer_schema_and_bounded_data_rules():
     assert text.count("Synthetic example ") == 3
 
 
-def test_agents_uses_only_the_fixed_s13_command_flags():
+def test_agents_uses_only_the_s13_s14_command_flows():
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     contract = {
-        "detect": {"--report", "--agent-summary", "--review-dir"},
-        "review-merge": {"--review-dir", "--report", "--agent-summary"},
-        "clean": {"-o", "--report", "--agent-summary"},
-        "update": {"--json"},
+        ("detect", frozenset({"--report", "--agent-summary", "--review-dir"})),
+        ("detect", frozenset({"--sanitize", "-o", "--report", "--agent-summary"})),
+        ("sanitize", frozenset({"--review-dir", "-o", "--report", "--agent-summary"})),
+        ("review-merge", frozenset({"--review-dir", "--report", "--agent-summary"})),
+        ("clean", frozenset({"-o", "--report", "--agent-summary"})),
+        ("update", frozenset({"--json"})),
     }
-    commands = [
-        shlex.split(line.strip())
-        for line in text.splitlines()
-        if line.strip().startswith("doc-sentinel ")
-    ]
-    assert {command[1] for command in commands} == set(contract)
-    for command in commands:
-        flags = {part for part in command[2:] if part.startswith("-")}
-        assert flags == contract[command[1]]
+    commands = [shlex.split(line.strip()) for line in text.splitlines()
+                if line.strip().startswith("doc-sentinel ")]
+    assert {(command[1], frozenset(part for part in command[2:] if part.startswith("-")))
+            for command in commands} == contract
 
 
 def test_agents_operating_contract_is_safe_and_agent_neutral():

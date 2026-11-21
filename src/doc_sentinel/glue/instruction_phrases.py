@@ -195,6 +195,22 @@ def _rule_spans(name: str, pattern: re.Pattern[str], folded: str) -> list[tuple[
     return spans
 
 
+def instruction_spans(source: str) -> list[tuple[int, int]]:
+    """Locate every primary rule in the original text, without using excerpts.
+
+    Family D only supplies context for an AI-addressing rule; the addressing
+    match already identifies that sentence, so it is not an independent span.
+    """
+    folded = _Folded(source)
+    matches = []
+    for name, family, pattern in _RULES:
+        if family == "d":
+            continue
+        for start, end in _rule_spans(name, pattern, folded.text):
+            matches.append(folded.span(start, end))
+    return matches
+
+
 class InstructionPhrasesAdapter:
     id = "instruction-phrases"
     mode = frozenset({"detect"})

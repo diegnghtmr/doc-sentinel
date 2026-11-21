@@ -104,11 +104,17 @@ def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None
             remaining, reparsed = plan_html(decoded, [])
             extracted = extract_after(reparsed, [])
             visible_text = "".join(a.char for a in reparsed.atoms if not a.hidden and not a.comment)
+            streams = [("body", "body", visible_text)] + [
+                (channel, pointer, "".join(a.char for a in atoms))
+                for channel, pointer, atoms in reparsed.attributes if not any(a.hidden for a in atoms)]
         else:
             remaining = plan_text(decoded, [])
             extracted = visible_text = decoded
+            streams = [("body", "body", visible_text)]
         delta_ok = _normalized(extracted) == _normalized(expected)
-        still_present = any(span["text"] in visible_text for span in spans)
+        still_present = any(span["channel"] == channel and span.get("pointer") in (None, pointer)
+                            and span["text"] in text for span in spans
+                            for channel, pointer, text in streams)
         checks = {
             "opens": _check("passed", "output decodes as UTF-8 and HTML is reparsed if applicable"),
             "render_equal": _check("skipped", "text/Markdown/HTML has no fixed page renderer"),

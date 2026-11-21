@@ -17,7 +17,7 @@ def test_agent_examples_use_supported_commands_and_flags(capsys):
     blocks = re.findall(r"```(?:text)?\n(.*?)```", text, flags=re.DOTALL)
     examples = [shlex.split(line.strip()) for block in blocks for line in block.splitlines()
                 if line.strip().startswith("doc-sentinel ")]
-    assert {args[1] for args in examples} == {"detect", "clean", "review-merge", "update"}
+    assert {args[1] for args in examples} == {"detect", "clean", "sanitize", "review-merge", "update"}
     for args in examples:
         with pytest.raises(SystemExit) as exc:
             cli.main([args[1], "--help"])

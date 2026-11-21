@@ -16,6 +16,22 @@ from doc_sentinel.schema import CHANNELS, CLASSES, SEVERITIES
 _ADAPTERS = frozenset(ADAPTERS) | {"channel-extract", "agent-review"}
 _BATCH_ID = re.compile(r"batch-[0-9]{3}\Z")
 _ERROR_STATUS = frozenset({"missing", "invalid", "oversize", "unreadable", "unexpected"})
+_TECHNIQUES = frozenset({"hidden-run", "tracked_deletion", "tracked_insertion_accepted",
+                         "invisible-unicode", "visible-injection", "hidden-element", "html-comment"})
+_SANITIZE_STATUS = frozenset({"sanitized", "nothing_to_do", "refused", "unsupported"})
+
+
+def _safe_refusal(status: str, reason: Any) -> str | None:
+    """Never forward an exception, document-derived text or arbitrary report string."""
+    if status not in {"refused", "unsupported"}:
+        return None
+    if status == "unsupported":
+        return "sanitize unsupported for this format"
+    if isinstance(reason, str) and reason.startswith("glyph/ToUnicode divergence"):
+        return "glyph/ToUnicode divergence lacks unambiguous mapping provenance"
+    if isinstance(reason, str) and reason.startswith("original input missing or changed"):
+        return "original input missing or changed since detection"
+    return "sanitization could not be completed safely"
 
 
 def _known_counts(values: list[Any], vocabulary: frozenset[str] | set[str]) -> dict[str, int]:
@@ -55,7 +71,7 @@ def make_summary(report: dict[str, Any], *, mode: str, exit_code: int,
     verdict = report.get("verdict")
     if verdict not in {"clean", "findings", "error", "cleaned", "already_clean", "residual"}:
         verdict = "error"
-    return {
+    summary = {
         "schema_version": 1,
         "mode": mode,
         "verdict": verdict,
@@ -77,3 +93,20 @@ def make_summary(report: dict[str, Any], *, mode: str, exit_code: int,
         "review": review,
         "review_errors": errors,
     }
+    sanitize = report.get("sanitize")
+    if isinstance(sanitize, dict):
+        status = sanitize.get("status")
+        if status not in _SANITIZE_STATUS:
+            status = "refused"
+        actions = sanitize.get("actions") if isinstance(sanitize.get("actions"), list) else []
+        actions = [item for item in actions if isinstance(item, dict)]
+        summary["sanitize"] = {
+            "status": status,
+            "output_path": output_path if status == "sanitized" else None,
+            "refusal_reason": _safe_refusal(status, sanitize.get("refusal_reason")),
+            "counts": {
+                "technique": _known_counts([a.get("technique") for a in actions], _TECHNIQUES),
+                "visibility": _known_counts([a.get("visibility") for a in actions], {"visible", "hidden"}),
+            },
+        }
+    return summary

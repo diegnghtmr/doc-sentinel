@@ -18,6 +18,9 @@ from doc_sentinel.sanitize.text import Edit, invisible_offsets
 _VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
                    "param", "source", "track", "wbr"})
 _REF = re.compile(r"&(?:\#[xX][0-9a-fA-F]+|\#[0-9]+|[a-zA-Z][a-zA-Z0-9]+);?")
+_ATTR = re.compile(r'''([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`=<>]+)))?''')
+_BLOCKS = frozenset({"p", "div", "li", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6",
+                     "br", "hr", "section", "article", "blockquote", "pre"})
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,8 @@ class _Parser(HTMLParser):
         self.stack: list[dict[str, Any]] = []
         self.atoms: list[Atom] = []
         self.ranges: list[Removal] = []
+        self.boundaries = [0]
+        self.attributes: list[tuple[str, str, list[Atom]]] = []
         self.non_inline = False
         self.has_stylesheet = False
 
@@ -89,8 +94,40 @@ class _Parser(HTMLParser):
             self.has_stylesheet = True
         if self.has_stylesheet or "class" in attr_map:
             self.non_inline = True
+        self._attributes(tag, attr_map, hidden=bool(reason or self._hidden()))
         return {"tag": tag, "start": self._pos(), "hidden": reason,
                 "atom_start": len(self.atoms), "outer_hidden": self._hidden()}
+
+    def _attributes(self, tag: str, values: dict[str, str | None], *, hidden: bool) -> None:
+        raw = self.get_starttag_text()
+        tag_end = re.match(r"<\s*[^\s/>]+", raw)
+        if tag_end is None:
+            raise ValueError("cannot locate HTML start tag")
+        for match in _ATTR.finditer(raw, tag_end.end()):
+            name = match.group(1).lower()
+            if name not in {"alt", "title", "href"} or values.get(name) is None:
+                continue
+            group = next((i for i in (2, 3, 4) if match.start(i) >= 0), None)
+            if group is None:
+                raise ValueError("cannot locate HTML attribute value")
+            start, end = match.span(group)
+            atoms = []
+            pos = start
+            while pos < end:
+                ref = _REF.match(raw, pos) if raw[pos] == "&" else None
+                if ref is not None and ref.end() <= end:
+                    decoded = html.unescape(ref.group())
+                    if decoded != ref.group():
+                        atoms.extend(Atom(char, self._pos() + pos, self._pos() + ref.end(), hidden)
+                                     for char in decoded)
+                        pos = ref.end()
+                        continue
+                atoms.append(Atom(raw[pos], self._pos() + pos, self._pos() + pos + 1, hidden))
+                pos += 1
+            if "".join(atom.char for atom in atoms) != values[name]:
+                raise ValueError("HTML attribute value cannot be mapped exactly")
+            channel = "hyperlink" if name == "href" else "alt"
+            self.attributes.append((channel, f"{tag}@{name}", atoms))
 
     def _finish(self, node: dict[str, Any], end: int) -> None:
         if node["hidden"] and not node["outer_hidden"]:
@@ -100,6 +137,8 @@ class _Parser(HTMLParser):
                 "inline visibility or hidden attribute conceals the element"), text))
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _BLOCKS:
+            self.boundaries.append(len(self.atoms))
         node = self._new_node(tag, attrs)
         if tag in _VOID:
             self._finish(node, self._pos() + len(self.get_starttag_text()))
@@ -118,6 +157,13 @@ class _Parser(HTMLParser):
         if end < 0:
             raise ValueError("unterminated HTML end tag")
         self._finish(self.stack.pop(), end + 1)
+        if tag in _BLOCKS:
+            self.boundaries.append(len(self.atoms))
+
+    def visible_segments(self) -> list[str]:
+        ends = [*self.boundaries, len(self.atoms)]
+        return ["".join(a.char for a in self.atoms[start:end] if not a.hidden and not a.comment)
+                for start, end in pairwise(ends) if start < end]
 
     def handle_data(self, data: str) -> None:
         if self._raw_text():
@@ -197,19 +243,34 @@ def plan_html(source: str, spans: list[dict[str, Any]]) -> tuple[list[Removal], 
     for span in spans:
         if not isinstance(span, dict):
             raise TypeError("injection span must be an object")
-        fragment = span.get("text")
-        if (span.get("channel") != "body" or span.get("pointer") not in (None, "body")
-                or not isinstance(fragment, str) or not fragment):
+        fragment, channel, pointer = span.get("text"), span.get("channel"), span.get("pointer")
+        if not isinstance(fragment, str) or not fragment:
             raise ValueError("HTML injection span has an invalid text, channel, or pointer")
-        start = text.find(fragment)
-        if start < 0 or text.find(fragment, start + 1) >= 0:
+        if channel == "body" and pointer in (None, "body"):
+            streams = [atoms]
+        elif channel in {"alt", "hyperlink"}:
+            streams = [values for kind, place, values in parsed.attributes
+                       if kind == channel and pointer in (None, place) and not any(a.hidden for a in values)]
+        else:
+            raise ValueError("HTML injection span has an invalid text, channel, or pointer")
+        hits = []
+        for stream in streams:
+            source_text = "".join(atom.char for atom in stream)
+            start = source_text.find(fragment)
+            while start >= 0:
+                hits.append((stream, start))
+                start = source_text.find(fragment, start + 1)
+        if len(hits) != 1:
             raise ValueError("HTML injection span is missing or ambiguous")
+        stream, start = hits[0]
         indexes = set(range(start, start + len(fragment)))
-        if selected.intersection(indexes):
-            raise ValueError("HTML injection spans overlap")
-        selected.update(indexes)
-        visible.extend(_text_removals(atoms, indexes, "visible-injection", "visible",
-                                     "caller supplied an exact visible injection fragment"))
+        if channel == "body":
+            if selected.intersection(indexes):
+                raise ValueError("HTML injection spans overlap")
+            selected.update(indexes)
+        visible.extend(_text_removals(stream, indexes, "visible-injection",
+                                     "visible" if channel == "body" else "hidden",
+                                     "caller supplied an exact injection fragment"))
     invisible = {index for index in invisible_offsets(text, leading_bom=False)
                  if index not in selected and not (atoms[index].start == 0
                                                    and atoms[index].char == "\ufeff")}
