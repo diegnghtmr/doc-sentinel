@@ -94,6 +94,16 @@ Both services run with `network_mode: none`; inputs are mounted read-only.
   not general language understanding. Other languages, paraphrases, and extraction failures can
   be missed; visible discussion can also produce medium-severity false positives.
 - OCR failures are currently skipped without a diagnostic in the report.
+- instruction-phrases boundaries (heuristic, by design):
+  - Obfuscation is judged inside the matched phrase or destination. An invisible character
+    placed right after the end of a URL or e-mail, or beyond the first 2048 URL characters,
+    does not raise severity on its own (unicode-smuggling-guard still reports it).
+  - Role rules require an explicit AI role, an unambiguous product name (ChatGPT, Copilot,
+    Gemini...) or, for names that are also first names (Claude, Dan), a vendor prefix or a
+    jailbreak-style continuation. Unusual phrasings can be missed; roleplay prose that
+    matches these shapes can be flagged as medium when visible.
+  - Severity is high only for hidden text, non-body channels, or obfuscated matches;
+    visible instructions are medium so documents that discuss injection are not blocked.
 
 ## Tests
 
