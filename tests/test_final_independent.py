@@ -59,6 +59,7 @@ def test_s4_l26_independent_roles(tmp_path, text, positive):
         assert findings[0].evidence["obfuscated"] is False
 
 
+@pytest.mark.integration  # the CLI part runs the real sub-harness adapters
 @pytest.mark.parametrize("expected,suffix,obfuscated", URL_CASES)
 def test_s4_l26_independent_url_spans_and_cli(tmp_path, capsys, expected, suffix, obfuscated):
     text = expected + suffix

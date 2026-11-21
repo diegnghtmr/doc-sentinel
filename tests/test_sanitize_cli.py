@@ -230,6 +230,7 @@ def _answer_review(review, *, label_for_origin=lambda _origin: "injection", labe
     return plan
 
 
+@pytest.mark.integration  # runs the real sub-harness adapters
 def test_reviewed_generated_exam_removes_hidden_content_once(workspace, corpus_directory, capsys):
     src = workspace / "exam-hidden-ai.docx"
     src.write_bytes((corpus_directory / src.name).read_bytes())
@@ -921,6 +922,7 @@ def test_pdf_exam_reconstruction_removes_located_hidden_instructions(
     assert code == 0 and stderr and json.loads(stdout)["verdict"] == "clean"
 
 
+@pytest.mark.integration  # runs the real sub-harness adapters
 def test_pdf_exam_with_real_adapters_locates_bboxless_findings(workspace, corpus_directory, capsys):
     src, report = workspace / "exam-hidden-ai.pdf", workspace / "report.json"
     src.write_bytes((corpus_directory / src.name).read_bytes())
@@ -959,6 +961,7 @@ def test_pdf_exam_with_real_adapters_locates_bboxless_findings(workspace, corpus
     assert digest(src) == before
 
 
+@pytest.mark.integration  # runs the real sub-harness adapters
 @pytest.mark.parametrize("name", ["pdf-white-on-white", "pdf-tiny-text", "pdf-ocg-off",
                                   "pdf-behind-rectangle", "pdf-outside-cropbox", "exam-hidden-ai"])
 def test_generated_pdf_real_adapters_sanitize_and_redetect(workspace, corpus_directory, capsys, name):
