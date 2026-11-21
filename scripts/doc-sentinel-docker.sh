@@ -3,9 +3,10 @@
 
 usage() {
     printf '%s\n' \
-        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,version,intent} ...' \
-        '  clean FILE [-o PATH] [--force-output] [--json] [--report PATH]' \
-        '  detect FILE [--json] [--report PATH] [--fail-on high|medium] [--prompt-guard]' \
+        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,review-merge,version,intent} ...' \
+        '  clean FILE [-o PATH] [--force-output] [--json|--agent-summary] [--report PATH]' \
+        '  detect FILE [--json|--agent-summary] [--report PATH] [--review-dir DIR]' \
+        '  review-merge --review-dir DIR [--report PATH] [--agent-summary]' \
         '  version | intent TEXT...' \
         '  update and --allow-network require the Python CLI on the host.'
 }
@@ -30,22 +31,23 @@ if [ "${1-}" = '--rebuild' ]; then rebuild=1; shift; fi
 case "$1" in
     --help|-h) usage; exit 0 ;;
     update) fail 'update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)' ;;
-    clean|detect|version|intent) mode=$1; shift ;;
+    clean|detect|review-merge|version|intent) mode=$1; shift ;;
     *) fail "unknown command: $1" ;;
 esac
 
-input=''; output=''; report=''; json=0; force=0; prompt_guard=0; fail_on=''
-if [ "$mode" = clean ] || [ "$mode" = detect ]; then
+input=''; output=''; report=''; review=''; json=0; agent=0; force=0; prompt_guard=0; fail_on=''
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
             --allow-network|--allow-network=*) fail '--allow-network is not available in the container launcher' ;;
-            -o|--output|--report|--fail-on)
+            -o|--output|--report|--fail-on|--review-dir)
                 option=$1; shift
                 [ "$#" -gt 0 ] && [ -n "$1" ] || fail "missing value for $option"
                 case "$option" in
                     -o|--output) [ "$mode" = clean ] || fail "unknown option: $option"; output=$1 ;;
                     --report) report=$1 ;;
+                    --review-dir) [ "$mode" != clean ] || fail "unknown option: $option"; review=$1 ;;
                     --fail-on) [ "$mode" = detect ] || fail "unknown option: $option"; fail_on=$1 ;;
                 esac ;;
             --output=*|-o?*)
@@ -53,8 +55,10 @@ if [ "$mode" = clean ] || [ "$mode" = detect ]; then
                 case "$1" in --output=*) output=${1#--output=} ;; *) output=${1#-o} ;; esac
                 [ -n "$output" ] || fail 'missing value for --output' ;;
             --report=*) report=${1#--report=}; [ -n "$report" ] || fail 'missing value for --report' ;;
+            --review-dir=*) [ "$mode" != clean ] || fail "unknown option: $1"; review=${1#--review-dir=}; [ -n "$review" ] || fail 'missing value for --review-dir' ;;
             --fail-on=*) [ "$mode" = detect ] || fail "unknown option: $1"; fail_on=${1#--fail-on=}; [ -n "$fail_on" ] || fail 'missing value for --fail-on' ;;
-            --json) json=1 ;;
+            --json) [ "$mode" != review-merge ] || fail "unknown option: $1"; json=1 ;;
+            --agent-summary) agent=1 ;;
             --force-output) [ "$mode" = clean ] || fail "unknown option: $1"; force=1 ;;
             --prompt-guard) [ "$mode" = detect ] || fail "unknown option: $1"; prompt_guard=1 ;;
             --)
@@ -62,18 +66,36 @@ if [ "$mode" = clean ] || [ "$mode" = detect ]; then
                 [ "$#" -eq 1 ] && [ -z "$input" ] || fail 'expected exactly one input file'
                 input=$1; shift; break ;;
             -*) fail "unknown option: $1" ;;
-            *) [ -z "$input" ] || fail 'expected exactly one input file'; input=$1 ;;
+            *) [ "$mode" != review-merge ] && [ -z "$input" ] || fail 'expected exactly one input file'; input=$1 ;;
         esac
         shift
     done
-    [ -n "$input" ] || fail 'expected an input file'
+    [ "$json" -eq 0 ] || [ "$agent" -eq 0 ] || fail '--json and --agent-summary are mutually exclusive'
     case "$fail_on" in ''|high|medium) ;; *) fail 'invalid --fail-on value (choose high or medium)' ;; esac
-    [ -f "$input" ] || {
-        case "$input" in /*) missing=$input ;; *) missing=$PWD/$input ;; esac
-        fail "input not found: $missing"
-    }
-    input=$(resolve_path "$input") || fail 'cannot resolve input path'
-    in_dir=$(dirname "$input"); in_name=$(basename "$input")
+    if [ "$mode" != review-merge ]; then
+        [ -n "$input" ] || fail 'expected an input file'
+        [ -f "$input" ] || {
+            case "$input" in /*) missing=$input ;; *) missing=$PWD/$input ;; esac
+            fail "input not found: $missing"
+        }
+        input_given=$input
+        input=$(resolve_path "$input") || fail 'cannot resolve input path'
+        in_dir=$(dirname "$input"); in_name=$(basename "$input")
+    else
+        [ -n "$review" ] || fail 'review-merge requires --review-dir'
+    fi
+    if [ -n "$review" ]; then
+        review=$(resolve_path "$review") || fail 'review parent directory does not exist'
+        [ "$review" != / ] || fail 'review directory must not contain the input document'
+        if [ -n "$input" ]; then
+            case "$input" in "$review"/*) fail 'review directory must not contain the input document' ;; esac
+        fi
+        if [ "$mode" = detect ]; then
+            (umask 077; mkdir -p "$review") || fail 'cannot create review directory'
+        else
+            [ -d "$review" ] || fail 'review directory does not exist'
+        fi
+    fi
     if [ "$mode" = clean ]; then
         if [ -z "$output" ]; then
             case "$in_name" in
@@ -92,7 +114,7 @@ if [ "$mode" = clean ] || [ "$mode" = detect ]; then
             if same_path "$report" "$input" || same_path "$report" "$output"; then
                 fail 'report path must differ from the input and the output document'
             fi
-        elif same_path "$report" "$input"; then
+        elif [ -n "$input" ] && same_path "$report" "$input"; then
             fail 'report path must differ from the input document'
         fi
         report_dir=$(dirname "$report"); report_name=$(basename "$report")
@@ -128,13 +150,14 @@ if [ "$rebuild" -eq 1 ] || ! docker image inspect doc-sentinel:local >/dev/null 
 fi
 
 # Save intent/version arguments as positional parameters, then prepend Docker arguments.
-if [ "$mode" = clean ] || [ "$mode" = detect ]; then
-    set -- "$mode" "/work/in/$in_name"
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
+    if [ "$mode" = review-merge ]; then set -- "$mode"; else set -- "$mode" "/work/in/$in_name"; fi
     if [ "$mode" = clean ]; then
         set -- "$@" -o "/work/out/$out_name"
         [ "$force" -eq 0 ] || set -- "$@" --force-output
     fi
     [ "$json" -eq 0 ] || set -- "$@" --json
+    [ "$agent" -eq 0 ] || set -- "$@" --agent-summary
     if [ -n "$report" ]; then
         if [ "$mode" = clean ] && [ "$report_dir" = "$out_dir" ]; then
             container_report=/work/out/$report_name
@@ -145,16 +168,24 @@ if [ "$mode" = clean ] || [ "$mode" = detect ]; then
     fi
     [ -z "$fail_on" ] || set -- "$@" --fail-on "$fail_on"
     [ "$prompt_guard" -eq 0 ] || set -- "$@" --prompt-guard
+    [ -z "$review" ] || set -- "$@" --review-dir /work/review
 else
     set -- "$mode" "$@"
 fi
 set -- doc-sentinel:local "$@"
-if [ "$mode" = clean ] || [ "$mode" = detect ]; then
-    if [ -n "$report" ] && { [ "$mode" = detect ] || [ "$report_dir" != "$out_dir" ]; }; then
+if [ "$mode" = clean ] || [ "$mode" = detect ] || [ "$mode" = review-merge ]; then
+    [ -z "$review" ] || set -- -v "$review:/work/review:rw" "$@"
+    if [ -n "$report" ] && { [ "$mode" != clean ] || [ "$report_dir" != "$out_dir" ]; }; then
         set -- -v "$report_dir:/work/report:rw" "$@"
     fi
     if [ "$mode" = clean ]; then set -- -v "$out_dir:/work/out:rw" "$@"; fi
-    set -- -v "$in_dir:/work/in:ro" "$@"
+    if [ "$mode" != review-merge ]; then set -- -v "$in_dir:/work/in:ro" "$@"; fi
+    if [ "$agent" -eq 1 ]; then
+        [ -z "$review" ] || set -- -e "DOC_SENTINEL_HOST_REVIEW=$review" "$@"
+        [ -z "$report" ] || set -- -e "DOC_SENTINEL_HOST_REPORT=$report" "$@"
+        [ -z "$output" ] || set -- -e "DOC_SENTINEL_HOST_OUTPUT=$output" "$@"
+        [ -z "$input" ] || set -- -e "DOC_SENTINEL_HOST_INPUT=$input_given" "$@"
+    fi
 fi
 if [ "$(uname -s)" = Linux ]; then set -- --user "$(id -u):$(id -g)" "$@"; fi
 set -- run --rm --network=none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g \

@@ -162,3 +162,12 @@ def test_claude_pointer_forbids_opening_user_data():
     assert "Task/Agent" in text
     assert "never use Read" in text
     assert "inbox" in text and "reports" in text
+
+
+def test_reviewer_contracts_name_the_datamarking_marker():
+    from doc_sentinel.review import MARKER
+    assert MARKER == "▁"
+    files = [PROMPT, CLAUDE, GEMINI, COPILOT, OPENCODE, CODEX]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert "U+2581" in text and MARKER in text, path

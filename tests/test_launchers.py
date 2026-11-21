@@ -39,7 +39,7 @@ class Harness:
         self.bin.mkdir()
         if backend == "sh":
             # Never fall through to a real Docker CLI, including the missing-Docker case.
-            for tool in ("dirname", "basename", "realpath", "uname", "id"):
+            for tool in ("dirname", "basename", "realpath", "uname", "id", "mkdir"):
                 (self.bin / tool).symlink_to(shutil.which(tool))
         fake = ROOT / "tests" / "launchers" / ("fake-docker.py" if backend == "sh" else "fake-docker.ps1")
         shutil.copyfile(fake, self.bin / "docker")
@@ -93,6 +93,9 @@ class Harness:
             pos = 12
         else:
             pos = 10
+        while run[pos:pos + 1] == ["-e"]:
+            assert run[pos + 1].startswith("DOC_SENTINEL_HOST_")
+            pos += 2
         for host_dir, target, mode in mounts:
             assert run[pos:pos + 2] == ["-v", f"{self.path(host_dir)}:{target}:{mode}"]
             pos += 2
@@ -150,6 +153,54 @@ class LauncherScenarios:
             (harness.input_dir, "/work/in", "ro"), (harness.report_dir, "/work/report", "rw")])
         assert args == ["detect", "/work/in/informe final.docx", "--json", "--report",
                         "/work/report/report.json", "--fail-on", "medium", "--prompt-guard"]
+
+    def test_detect_review_dir_and_agent_summary(self, harness):
+        review = harness.report_dir / "review dir"
+        review.mkdir()
+        report = harness.report_dir / "report.json"
+        result = harness.run("detect", harness.input, "--agent-summary", "--review-dir", review,
+                             "--report", report)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_REVIEW={harness.path(review)}" in recorded
+        assert f"DOC_SENTINEL_HOST_INPUT={harness.path(harness.input)}" in recorded
+        args = harness.assert_base(recorded, [
+            (harness.input_dir, "/work/in", "ro"), (harness.report_dir, "/work/report", "rw"),
+            (review, "/work/review", "rw")])
+        assert args == ["detect", "/work/in/informe final.docx", "--agent-summary", "--report",
+                        "/work/report/report.json", "--review-dir", "/work/review"]
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    def test_review_merge_maps_review_and_report(self, harness):
+        review = harness.report_dir / "review dir"
+        review.mkdir()
+        report = harness.report_dir / "merged.json"
+        result = harness.run("review-merge", "--review-dir", review, "--report", report,
+                             "--agent-summary")
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+        recorded = harness.run_args()
+        assert f"DOC_SENTINEL_HOST_REVIEW={harness.path(review)}" in recorded
+        assert f"DOC_SENTINEL_HOST_REPORT={harness.path(report)}" in recorded
+        args = harness.assert_base(recorded, [
+            (harness.report_dir, "/work/report", "rw"), (review, "/work/review", "rw")])
+        assert args == ["review-merge", "--agent-summary", "--report", "/work/report/merged.json",
+                        "--review-dir", "/work/review"]
+
+    def test_clean_agent_summary_is_forwarded(self, harness):
+        result = harness.run("clean", harness.input, "--agent-summary")
+        assert result.returncode == 0
+        args = harness.assert_base(harness.run_args(), [
+            (harness.input_dir, "/work/in", "ro"), (harness.input_dir, "/work/out", "rw")])
+        assert args == ["clean", "/work/in/informe final.docx", "-o",
+                        "/work/out/informe final.cleaned.docx", "--agent-summary"]
+
+    @pytest.mark.parametrize("ancestor", [False, True])
+    def test_refuse_review_dir_containing_input(self, harness, ancestor):
+        review = harness.root if ancestor else harness.input_dir
+        result = harness.run("detect", harness.input, "--review-dir", review, "--agent-summary")
+        assert result.returncode == 2 and result.stdout == "" and "review" in result.stderr.lower()
+        assert harness.input.read_bytes() == b"synthetic input, unchanged"
+        assert harness.calls() == []
 
     @pytest.mark.parametrize("args", [("version",), ("intent", "revisa y límpialo")])
     def test_version_and_intent_pass_through(self, harness, args):
@@ -259,6 +310,18 @@ class LauncherScenarios:
 
 
 class TestShLauncher(LauncherScenarios):
+    def test_review_root_is_refused(self, harness):
+        result = harness.run("detect", harness.input, "--review-dir", "/", "--agent-summary")
+        assert result.returncode == 2 and result.stdout == "" and "review" in result.stderr.lower()
+        assert not harness.calls() and harness.input.read_bytes() == b"synthetic input, unchanged"
+
+    def test_summary_retains_user_input_path_not_symlink_target(self, harness):
+        alias = harness.input_dir / "alias.txt"
+        alias.symlink_to(harness.input.name)
+        result = harness.run("detect", alias, "--agent-summary")
+        assert result.returncode == 0
+        assert f"DOC_SENTINEL_HOST_INPUT={harness.path(alias)}" in harness.run_args()
+
     def test_rebuild_switch(self, harness):
         result = harness.run("--rebuild", "version")
         assert result.returncode == 0

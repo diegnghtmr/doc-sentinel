@@ -24,13 +24,7 @@ def real_docker():
     inspect = subprocess.run([docker, "image", "inspect", PS_IMAGE], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, env=env, check=False)
     if inspect.returncode:
-        try:
-            pull = subprocess.run([docker, "pull", PS_IMAGE], stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL, env=env, timeout=300, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            pytest.skip("PowerShell image cannot be pulled")
-        if pull.returncode:
-            pytest.skip("PowerShell image cannot be pulled")
+        pytest.skip("PowerShell image is not cached; tests never pull images")
     return docker, env
 
 

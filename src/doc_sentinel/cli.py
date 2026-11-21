@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from doc_sentinel import __version__
 from doc_sentinel.adapters.base import repo_root
+from doc_sentinel.agent_summary import make_summary
 from doc_sentinel.intents import classify
 from doc_sentinel.pins import checkout_sha, load_lock
 from doc_sentinel.pipeline import UsageError, default_output, run_clean, run_detect
@@ -38,13 +40,21 @@ def _parser() -> argparse.ArgumentParser:
                        help="destination (default: <stem>.cleaned<suffix> next to the input)")
     clean.add_argument("--force-output", action="store_true",
                        help="replace an existing output file (never the input)")
-    clean.add_argument("--json", action="store_true", help="print the JSON report on stdout")
+    clean_format = clean.add_mutually_exclusive_group()
+    clean_format.add_argument("--json", action="store_true", help="print the JSON report on stdout")
+    clean_format.add_argument("--agent-summary", action="store_true",
+                              help="print only the orchestrator-safe JSON summary on stdout")
     clean.add_argument("--report", type=Path,
                        help="write the report to PATH (.md = Markdown, otherwise JSON)")
 
     detect = sub.add_parser("detect", help="read-only scan for prompt injection / hidden text")
     detect.add_argument("file", type=Path)
-    detect.add_argument("--json", action="store_true", help="print the JSON report on stdout")
+    detect_format = detect.add_mutually_exclusive_group()
+    detect_format.add_argument("--json", action="store_true", help="print the JSON report on stdout")
+    detect_format.add_argument("--agent-summary", action="store_true",
+                               help="print only the orchestrator-safe JSON summary on stdout")
+    detect.add_argument("--review-dir", type=Path,
+                        help="write an isolated semantic review plan and batches to DIR")
     detect.add_argument("--report", type=Path,
                         help="write the report to PATH (.md = Markdown, otherwise JSON)")
     detect.add_argument("--allow-network", action="store_true",
@@ -54,6 +64,12 @@ def _parser() -> argparse.ArgumentParser:
                              "the model already in the Hugging Face cache; never downloads)")
     detect.add_argument("--fail-on", choices=("high", "medium"), default="high",
                         help="lowest severity that makes the exit code 1 (default: high)")
+
+    merge = sub.add_parser("review-merge", help="validate reviewer answers and re-aggregate")
+    merge.add_argument("--review-dir", required=True, type=Path, help="review plan and answers")
+    merge.add_argument("--report", type=Path, help="write the merged report to PATH")
+    merge.add_argument("--agent-summary", action="store_true",
+                       help="print only the orchestrator-safe JSON summary on stdout")
 
     update = sub.add_parser("update", help="move pins to the latest main, roll back on failure")
     update.add_argument("--dry-run", action="store_true",
@@ -83,10 +99,33 @@ def _pin_report(args: argparse.Namespace) -> PinnedTarget | None:
     return pin_target(args.report, protect=protect)
 
 
-def _emit(report: dict, args: argparse.Namespace, report_target: PinnedTarget | None) -> None:
+def _emit(report: dict, args: argparse.Namespace, report_target: PinnedTarget | None,
+          code: int, review: dict | None = None) -> None:
     if report_target is not None:
         write_report(report, report_target)
-    if args.json:
+    if getattr(args, "agent_summary", False):
+        input_path = str(args.file) if hasattr(args, "file") else None
+        if input_path and input_path.startswith("/work/in/"):
+            input_path = os.environ.get("DOC_SENTINEL_HOST_INPUT", input_path)
+        output_path = None
+        if args.command == "clean" and report.get("output_path"):
+            output_path = str(args.output or default_output(args.file))
+            if output_path.startswith("/work/out/"):
+                output_path = os.environ.get("DOC_SENTINEL_HOST_OUTPUT", output_path)
+        report_path = str(args.report) if args.report else None
+        if report_path and report_path.startswith(("/work/report/", "/work/out/")):
+            report_path = os.environ.get("DOC_SENTINEL_HOST_REPORT", report_path)
+        if review and str(getattr(args, "review_dir", "")) == "/work/review":
+            host = os.environ.get("DOC_SENTINEL_HOST_REVIEW")
+            if host:
+                review = {**review, "plan_path": str(Path(host) / "plan.json"),
+                          "batches": [{**batch, "path": str(Path(host) / "batches" /
+                                      f"{batch['batch_id']}.json")} for batch in review["batches"]]}
+        summary = make_summary(report, mode=args.command, exit_code=code, input_path=input_path,
+                               output_path=output_path, report_path=report_path, review=review)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        print(to_human_summary(report), file=sys.stderr)
+    elif getattr(args, "json", False):
         print(json.dumps(report, indent=2, ensure_ascii=False))
         print(to_human_summary(report), file=sys.stderr)
     else:
@@ -129,10 +168,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "detect":
             if not args.file.is_file():
                 raise UsageError(f"input not found: {args.file}")
+            targets = None
+            if args.review_dir:
+                from doc_sentinel.review import prepare_review
+
+                if args.report and args.review_dir.resolve() in args.report.resolve().parents:
+                    raise UsageError("report path must be outside the review directory")
+                targets = prepare_review(args.review_dir, args.file)
             report_target = _pin_report(args)
-            report, code = run_detect(args.file, allow_network=args.allow_network,
-                                      fail_on=args.fail_on, prompt_guard=args.prompt_guard)
-            _emit(report, args, report_target)
+            options = {"allow_network": args.allow_network, "fail_on": args.fail_on,
+                       "prompt_guard": args.prompt_guard}
+            if targets is not None:
+                options["review_targets"] = targets
+            report, code = run_detect(args.file, **options)
+            _emit(report, args, report_target, code, targets.summary if targets else None)
             return code
         if args.command == "clean":
             if not args.file.is_file():
@@ -140,7 +189,16 @@ def main(argv: list[str] | None = None) -> int:
             report_target = _pin_report(args)
             report, code = run_clean(args.file, output=args.output,
                                      force_output=args.force_output, report_path=args.report)
-            _emit(report, args, report_target)
+            _emit(report, args, report_target, code)
+            return code
+        if args.command == "review-merge":
+            from doc_sentinel.review import load_plan, merge, pin_merge_report, public_review
+
+            root = args.review_dir.resolve()
+            plan, original = load_plan(root)
+            report_target = pin_merge_report(args.report, root, original) if args.report else None
+            report, code = merge(root, plan, original)
+            _emit(report, args, report_target, code, public_review(root, plan))
             return code
         if args.command == "update":
             from doc_sentinel.update import run_update
@@ -156,6 +214,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"doc-sentinel: unsafe write refused: {exc}", file=sys.stderr)
         return 2
     except UsageError as exc:
+        print(f"doc-sentinel: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"doc-sentinel: I/O failure: {exc.strerror or 'unavailable'}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        from doc_sentinel.review import ReviewError
+
+        if not isinstance(exc, ReviewError):
+            raise
         print(f"doc-sentinel: {exc}", file=sys.stderr)
         return 2
     except ImportError as exc:
