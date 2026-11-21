@@ -7,6 +7,7 @@ not already exist. No output is published until all applicable checks pass.
 """
 from __future__ import annotations
 
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,10 +59,22 @@ def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None
             return SanitizeResult("refused", refusal_reason="detected hidden content cannot be located")
         target = pin_target(dest, protect=(src,))
         kind = detect_type(src)
-        if kind not in {"txt", "md", "html"}:
-            return SanitizeResult("unsupported", refusal_reason=f"sanitize unsupported for {kind}")
-        original = src.read_bytes().decode("utf-8")
         spans = injection_spans if injection_spans is not None else []
+        if kind == "docx":
+            from doc_sentinel.sanitize.docx import sanitize_docx
+
+            outcome = sanitize_docx(src, spans, workdir)
+            if outcome.status == "sanitized":
+                if outcome.data is None:
+                    raise ValueError("verified DOCX output is missing")
+                atomic_write_bytes(target, outcome.data)
+            return SanitizeResult(outcome.status, outcome.actions, outcome.checks, outcome.reason)
+        if kind not in {"txt", "md", "html"}:
+            reason = f"sanitize unsupported for {kind}"
+            if kind == "pdf":
+                reason += ": position-preserving content-stream editor is unavailable"
+            return SanitizeResult("unsupported", refusal_reason=reason)
+        original = src.read_bytes().decode("utf-8")
         non_inline = False
         if kind == "html":
             removals, parsed = plan_html(original, spans)
@@ -108,5 +121,5 @@ def sanitize(src: Path, dest: Path, *, injection_spans: list[dict] | None = None
             return SanitizeResult("refused", actions, checks, "output self-check failed")
         atomic_write_bytes(target, encoded)
         return SanitizeResult("sanitized", actions, checks)
-    except (OSError, TypeError, ValueError, UnicodeError) as exc:
+    except (OSError, TypeError, ValueError, UnicodeError, zipfile.BadZipFile) as exc:
         return SanitizeResult("refused", refusal_reason=f"cannot sanitize safely: {exc}")
