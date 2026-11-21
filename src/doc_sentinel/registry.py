@@ -15,6 +15,7 @@ from doc_sentinel.adapters.base import Capability
 ADAPTERS: dict[str, str] = {
     "watermarks-remover": "doc_sentinel.adapters.watermarks_remover:WatermarksRemoverAdapter",
     "ooxml-paste-residue": "doc_sentinel.glue.ooxml_paste:OoxmlPasteResidueCleaner",
+    "ooxml-fingerprint": "doc_sentinel.glue.ooxml_fingerprint:OoxmlFingerprintCleaner",
     "perlecta": "doc_sentinel.adapters.perlecta:PerlectaAdapter",
     "hidden-text-detector": "doc_sentinel.adapters.hidden_text_detector:HiddenTextDetectorAdapter",
     "subtext-scan": "doc_sentinel.adapters.subtext_scan:SubtextScanAdapter",
@@ -60,7 +61,7 @@ CLEAN_MATRIX: dict[str, tuple[str, ...]] = {
     kind: ("watermarks-remover",)
     for kind in ("txt", "md", "html", "pdf", "xlsx", "pptx", "epub", "odt", "image", "svg")
 }
-CLEAN_MATRIX["docx"] = ("watermarks-remover", "ooxml-paste-residue")
+CLEAN_MATRIX["docx"] = ("watermarks-remover", "ooxml-fingerprint", "ooxml-paste-residue")
 
 
 class Unavailable:

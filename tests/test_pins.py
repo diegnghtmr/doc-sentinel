@@ -31,6 +31,12 @@ def test_lockfile_shape():
         assert pin["path"] == f"third_party/{pin['id']}"
 
 
+def _checkout_sha(path: Path) -> str | None:
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=False)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
 def test_every_pin_is_a_submodule_gitlink_at_the_locked_sha():
     if not (ROOT / ".git").exists():
         pytest.skip("not a git checkout")
@@ -38,7 +44,10 @@ def test_every_pin_is_a_submodule_gitlink_at_the_locked_sha():
         out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-s", pin["path"]],
                              capture_output=True, text=True, check=True).stdout.split()
         assert out[0] == "160000", f"{pin['id']} is not a submodule gitlink"
-        assert out[1] == pin["sha"], f"{pin['id']}: gitlink {out[1]} != lock {pin['sha']}"
+        # `doc-sentinel update` moves the lock and the checkout but never stages the gitlink
+        # (the human commits it), so either the indexed gitlink or the checkout must match.
+        actual = {out[1], _checkout_sha(ROOT / pin["path"])}
+        assert pin["sha"] in actual, f"{pin['id']}: gitlink/checkout {actual} != lock {pin['sha']}"
 
 
 def test_initial_pins_match_plan_until_first_update():
