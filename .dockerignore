@@ -5,6 +5,17 @@
 /*.pdf
 /*.doc
 /*.odt
+/*.rtf
+/*.txt
+/*.csv
+/*.eml
+/*.html
+/*.htm
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
 # Test documents in vendored submodules are not needed by the runtime either.
 **/*.docx
 **/*.xlsx
@@ -14,6 +25,7 @@
 **/*.odt
 *.cleaned.*
 /samples/
+/inbox/
 /work/
 /reports/
 /tests/corpus/generated/
@@ -21,6 +33,8 @@
 # Local environments, caches, compiled binaries, and repository/agent metadata.
 /.venv/
 /.cache/
+**/.env
+**/.env.*
 /bin/
 /.git/
 **/.git

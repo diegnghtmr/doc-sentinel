@@ -268,6 +268,16 @@ function Invoke-Launcher([string[]]$Arguments) {
                 if ($inName.StartsWith('.') -and $inName.IndexOf('.', 1) -lt 0) { $extension = '' }
                 $stem = if ($extension) { $inName.Substring(0, $inName.Length - $extension.Length) } else { $inName }
                 $suffix = if ($sanitized) { 'sanitized' } else { 'cleaned' }
+                if ($sanitized) {
+                    try {
+                        $stream = [IO.File]::OpenRead($inputPath)
+                        try {
+                            $header = New-Object byte[] 1024
+                            $count = $stream.Read($header, 0, $header.Length)
+                        } finally { $stream.Dispose() }
+                        if ([Text.Encoding]::ASCII.GetString($header, 0, $count).Contains('%PDF-')) { $extension = '.docx' }
+                    } catch { Write-LauncherError 'cannot read input header'; return 2 }
+                }
                 $outputPath = Join-Path $inDir "$stem.$suffix$extension"
             }
             try { $outputPath = Resolve-HostPath $outputPath }

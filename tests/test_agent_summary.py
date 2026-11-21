@@ -87,6 +87,29 @@ def test_clean_agent_summary_uses_only_caller_paths(monkeypatch, scratch, capsys
     assert safe["verdict"] == "cleaned" and safe["exit_code"] == 0
 
 
+@pytest.mark.parametrize("scores,expected", [
+    ([0.2, 0.8], {"min": 0.2, "mean": 0.5}),
+    ([0.9], {"min": 0.9, "mean": 0.9}),
+    (["HOSTILE"], None),
+    ([float("nan")], None),
+    ([True], None),
+    ([1.1], None),
+    ([], None),
+])
+def test_pdf_summary_similarity_is_numeric_only(scores, expected):
+    from doc_sentinel.agent_summary import make_summary
+
+    report = {"verdict": "findings", "findings": [], "sanitize": {
+        "status": "sanitized", "checks": {"visual_similarity": scores}, "actions": [
+            {"technique": "render-mode-3", "visibility": "hidden", "removed_text": "HOSTILE"}]}}
+    summary = make_summary(report, mode="detect", exit_code=1, input_path="source.pdf",
+                           output_path="out.docx", report_path=None)
+    assert summary["sanitize"].get("visual_similarity") == expected
+    assert summary["sanitize"]["counts"] == {"technique": {"render-mode-3": 1},
+                                             "visibility": {"hidden": 1}}
+    assert "HOSTILE" not in json.dumps(summary)
+
+
 def test_json_and_agent_summary_are_mutually_exclusive(scratch, capsys):
     src = scratch / "x.txt"
     src.write_text("ordinary", encoding="utf-8")

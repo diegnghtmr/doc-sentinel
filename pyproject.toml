@@ -18,12 +18,12 @@ dependencies = [
 # PDF cleaning verifies and, without exiftool, rewrites AI metadata in the output copy.
 clean = [
     "pikepdf>=8",
-    "pymupdf>=1.24",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
 ]
 # Runtime deps of the pinned sub-harnesses that run as child processes in this venv.
 detect = [
     "pikepdf>=8",
-    "pymupdf>=1.24",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
     "python-docx>=1.1",
     "numpy>=1.24",
     "pytesseract>=0.3",
@@ -35,7 +35,7 @@ promptguard = [
 ]
 dev = [
     "pikepdf>=8",
-    "pymupdf>=1.24",
+    "pymupdf>=1.24,<2",  # 2.x pulls pymupdf-layout -> onnxruntime (unused)
     "pytest>=8",
     "ruff>=0.5",
     "reportlab>=4",

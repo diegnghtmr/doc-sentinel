@@ -710,3 +710,41 @@ def test_version_without_git_metadata_reports_pins_not_mismatch(monkeypatch, cap
     assert code == 0
     assert "MISMATCH" not in out
     assert "pinned (no git checkout to compare)" in out
+
+
+def test_child_env_routes_pymupdf_messages_to_stderr(tmp_path):
+    # PyMuPDF 1.x prints a 'fitz API is deprecated' warning on stdout when a sub-harness
+    # imports fitz; that line corrupted hidden-text-detector's JSON report.
+    from doc_sentinel.adapters.base import RunContext, child_env
+    env = child_env(RunContext(workdir=tmp_path))
+    assert env["PYMUPDF_MESSAGE"] == "fd:2"
+
+
+def test_fitz_import_in_child_keeps_stdout_clean(tmp_path):
+    pytest.importorskip("pymupdf")
+    import sys
+
+    from doc_sentinel.adapters.base import RunContext, run_tool
+    ctx = RunContext(workdir=tmp_path, allow_network=True)
+    proc = run_tool([sys.executable, "-c", "import fitz, json; print(json.dumps({'ok': 1}))"], ctx)
+    assert proc.stdout.strip() == '{"ok": 1}'
+
+
+def test_in_process_pymupdf_never_writes_to_stdout(tmp_path, capfd):
+    # PyMuPDF 1.x prints a 'pymupdf_layout' recommendation on stdout from find_tables();
+    # in-process use must keep stdout clean for --json / --agent-summary output.
+    pytest.importorskip("pymupdf")
+    from doc_sentinel._pymupdf import load
+
+    pymupdf = load()
+    pdf = tmp_path / "t.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Cell A    Cell B")
+    doc.save(pdf)
+    doc.close()
+    capfd.readouterr()
+    with load().open(pdf) as reopened:
+        reopened[0].find_tables()
+        reopened[0].get_text("dict", sort=True)
+    assert capfd.readouterr().out == ""

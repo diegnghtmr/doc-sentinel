@@ -65,7 +65,7 @@ def _parser() -> argparse.ArgumentParser:
     detect.add_argument("--sanitize", action="store_true",
                         help="optionally write a separately verified sanitized copy")
     detect.add_argument("-o", "--output", type=Path,
-                        help="sanitized destination (requires --sanitize)")
+                        help="sanitized destination (requires --sanitize; PDF output must be .docx)")
     detect.add_argument("--force-output", action="store_true",
                         help="replace an existing sanitized output after verification")
     detect.add_argument("--review-dir", type=Path,
@@ -84,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     sanitized.add_argument("file", type=Path, help="original input, verified against the review plan")
     sanitized.add_argument("--review-dir", required=True, type=Path, help="review plan and answers")
     sanitized.add_argument("-o", "--output", type=Path,
-                           help="destination (default: <stem>.sanitized<suffix>)")
+                           help="destination (default: <stem>.sanitized<suffix>; PDF: .sanitized.docx)")
     sanitized.add_argument("--force-output", action="store_true",
                            help="replace an existing output only after verification")
     sanitized.add_argument("--report", type=Path, help="write the report to PATH")

@@ -36,6 +36,7 @@ If channel extraction fails (e.g. an archive part over the size limit), the verd
 
 When explicitly requested, use `detect FILE --sanitize --report REPORT --agent-summary`
 to scan the original and create `<stem>.sanitized<suffix>` beside it, or specify `-o`.
+For PDF input the output is a reconstructed `<stem>.sanitized.docx`; `-o` must end in `.docx`.
 After semantic review and `review-merge`, use `sanitize FILE --review-dir DIR --report
 REPORT --agent-summary`; the original input is mounted again and its SHA-256 must match
 the review plan. The detect verdict remains the original document's verdict. A refused
@@ -48,12 +49,27 @@ The separate report records each action and its location, technique, visibility,
 removed text. The agent summary includes only status, output path, a safe refusal reason,
 and counts by technique and visibility, never removed text. Visible instructions are removed
 by sentence; hidden content is removed by run or element. DOCX, HTML, TXT and MD are supported
-within conservative exact-span limits. PDF will be sanitized as a faithful DOCX reconstruction
-(S15, in progress); PDF sanitization is not yet available. Glyph/ToUnicode divergence is
-refused rather than guessed. Checks include opening the copy, extraction deltas, re-detection,
+within conservative exact-span limits. For a PDF finding without a bounding box, every match of
+complete native text on the applicable page(s) must be independently verified hidden. Recognized
+aggregate findings require every span meeting their criterion to be verified and excluded, with the
+sample present among those exclusions. Other partial or ambiguous findings are refused.
+Glyph/ToUnicode divergence or unlocatable PDF hidden text is refused rather than guessed.
+Checks include opening the copy, extraction deltas, re-detection,
 and DOCX page-by-page rendering (rendering is not fixed-page for TXT/MD/HTML). Tracked changes
 use the final view: deletions are removed, insertions are accepted, and rendering is compared
 against a final-view copy of the original.
+
+PDF reconstruction uses visible content, not an editable copy of the original PDF:
+
+| Content | Reconstruction |
+| --- | --- |
+| Text and layout | Preserves text and estimates reading order, paragraphs, font family/size/style/color, alignment, margins and page breaks; layout may differ. |
+| Tables, links, images | Rebuilds detected tables and visible links; retains images with approximate placement and size. Repeated top/bottom lines can become headers/footers. |
+| Scanned pages | Keeps page images; **no OCR text is added**. |
+| Hidden and malicious text | Excludes identified hidden content and visible injection sentences; ambiguous regions are refused. |
+
+The report includes per-page visual similarity between the original PDF and the rendered DOCX;
+its minimum and mean appear in the safe summary. This metric is informative, not a pass/fail gate.
 
 ## Sub-harnesses
 

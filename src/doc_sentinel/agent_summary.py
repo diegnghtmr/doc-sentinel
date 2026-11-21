@@ -6,6 +6,7 @@ emitted. Reasons, warnings, excerpts, evidence, and report-provided paths are no
 """
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from typing import Any
@@ -17,8 +18,20 @@ _ADAPTERS = frozenset(ADAPTERS) | {"channel-extract", "agent-review"}
 _BATCH_ID = re.compile(r"batch-[0-9]{3}\Z")
 _ERROR_STATUS = frozenset({"missing", "invalid", "oversize", "unreadable", "unexpected"})
 _TECHNIQUES = frozenset({"hidden-run", "tracked_deletion", "tracked_insertion_accepted",
-                         "invisible-unicode", "visible-injection", "hidden-element", "html-comment"})
+                         "invisible-unicode", "visible-injection", "hidden-element", "html-comment",
+                         "render-mode-3", "optional-content-off", "zero-opacity", "outside-cropbox",
+                         "tiny-background-match", "hidden-region", "hyperlink-injection",
+                         "metadata-injection"})
 _SANITIZE_STATUS = frozenset({"sanitized", "nothing_to_do", "refused", "unsupported"})
+_PDF_LOCATION_REFUSALS = frozenset({
+    "PDF hidden finding has an invalid page",
+    "PDF hidden finding has no complete native text",
+    "PDF hidden text geometry cannot be verified",
+    "PDF hidden text match is missing or ambiguous",
+    "PDF hidden text match is not verifiably hidden",
+    "PDF aggregate criterion has an unverifiable span",
+    "PDF aggregate sample is not covered by excluded text",
+})
 
 
 def _safe_refusal(status: str, reason: Any) -> str | None:
@@ -31,6 +44,9 @@ def _safe_refusal(status: str, reason: Any) -> str | None:
         return "glyph/ToUnicode divergence lacks unambiguous mapping provenance"
     if isinstance(reason, str) and reason.startswith("original input missing or changed"):
         return "original input missing or changed since detection"
+    if isinstance(reason, str) and (
+            reason == "detected hidden content cannot be located" or reason in _PDF_LOCATION_REFUSALS):
+        return reason
     return "sanitization could not be completed safely"
 
 
@@ -109,4 +125,10 @@ def make_summary(report: dict[str, Any], *, mode: str, exit_code: int,
                 "visibility": _known_counts([a.get("visibility") for a in actions], {"visible", "hidden"}),
             },
         }
+        checks = sanitize.get("checks")
+        scores = checks.get("visual_similarity") if isinstance(checks, dict) else None
+        if (isinstance(scores, list) and scores and all(
+                type(value) in (int, float) and math.isfinite(value) and -1 <= value <= 1
+                for value in scores)):
+            summary["sanitize"]["visual_similarity"] = {"min": min(scores), "mean": sum(scores) / len(scores)}
     return summary

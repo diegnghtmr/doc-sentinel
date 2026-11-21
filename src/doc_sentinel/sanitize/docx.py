@@ -474,7 +474,8 @@ def render_equal(src: Path, candidate: Path, visible: list[str], workdir: Path, 
     if executable is None:
         return False, [], "LibreOffice is unavailable"
     try:
-        import pymupdf
+        from doc_sentinel._pymupdf import load as _load_pymupdf
+        pymupdf = _load_pymupdf()
 
         with tempfile.TemporaryDirectory(prefix="doc-sentinel-render-", dir=workdir) as scratch:
             root = Path(scratch)

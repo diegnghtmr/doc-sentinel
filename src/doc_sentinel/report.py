@@ -98,10 +98,14 @@ def to_markdown(report: dict[str, Any]) -> str:
         if section.get("refusal_reason"):
             lines.append("- Refusal reason: " + section["refusal_reason"])
         for action in section.get("actions", []):
+            size = (f"; bytes removed={action['bytes_removed']}" if "bytes_removed" in action else "")
             lines += ["", (f"- {action['technique']} ({action['visibility']}); "
-                           f"part={action['part']}; location={action['location']}; "
-                           f"bytes removed={action['bytes_removed']}; reason={action['reason']}")]
+                           f"part={action['part']}; location={action['location']}"
+                           f"{size}; reason={action['reason']}")]
             lines.append(_fence(action.get("removed_text", "")))
+        similarity = section.get("checks", {}).get("visual_similarity")
+        if isinstance(similarity, list):
+            lines.append(f"- Visual similarity by page (informative): {similarity}")
     lines += ["", f"## Findings ({len(report['findings'])})", ""]
     if not report["findings"]:
         lines.append("No findings.")

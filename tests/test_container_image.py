@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = "doc-sentinel:local"
+IMAGE = os.environ.get("DOC_SENTINEL_IMAGE", "doc-sentinel:local")
 USER = "10001:10001"
 pytestmark = pytest.mark.integration
 
@@ -40,7 +41,7 @@ def mounts(corpus_directory):
             directory.chmod(0o777)
         for name in ("exam-hidden-ai.docx", "exam-hidden-ai.pdf", "spanish-exam-control.docx",
                      "ai-traces.docx", "ai-traces.xlsx", "ai-traces.pptx",
-                     "pdf-ai-producer-traces.pdf", "c2pa-signed-C.jpg"):
+                     "pdf-ai-producer-traces.pdf", "pdf-white-on-white.pdf", "c2pa-signed-C.jpg"):
             fixture = corpus_directory / name
             if fixture.is_file():
                 shutil.copyfile(fixture, source / name)
@@ -166,9 +167,61 @@ def test_clean_writes_owned_copy_and_report_with_tools_available(mounts, name, i
         assert report["c2pa"]["before"] is True and report["c2pa"]["after"] is False
 
 
+@pytest.mark.parametrize("name,output_name,exit_code,checks", [
+    ("exam-hidden-ai.docx", "exam.sanitized.docx", 1,
+     {"opens": "passed", "extraction_delta_ok": "passed", "redetect_clean": "passed",
+      "render_equal": "passed"}),
+    ("zero-width.txt", "text.sanitized.txt", 0,
+     {"opens": "passed", "extraction_delta_ok": "passed", "redetect_clean": "passed",
+      "render_equal": "skipped"}),
+    ("pdf-white-on-white.pdf", "pdf.sanitized.docx", 1,
+     {"opens": "passed", "text_equal": "passed", "redetect_clean": "passed"}),
+])
+def test_sanitize_generated_copy_in_hardened_container(mounts, name, output_name, exit_code, checks):
+    source, output, reports = mounts
+    original = source / name
+    assert original.is_file(), f"missing synthetic fixture: {name}"
+    before = digest(original)
+    source_names = {path.name for path in source.iterdir()}
+    destination = f"/work/out/{output_name}"
+    proc = docker_run(["detect", f"/work/in/{name}", "--sanitize", "-o", destination,
+                       "--report", "/work/report/sanitize.json", "--agent-summary"], mounts)
+    summary = parse_report(proc)
+    assert (proc.returncode, summary["exit_code"], summary["verdict"]) == (
+        exit_code, exit_code, "findings")
+    assert summary["sanitize"]["status"] == "sanitized", summary
+    assert summary["sanitize"]["output_path"] == destination
+    if name.endswith(".pdf"):
+        similarity = summary["sanitize"]["visual_similarity"]
+        assert -1 <= similarity["min"] <= similarity["mean"] <= 1
+    assert summary["adapters"]["failed"] == [] and summary["adapters"]["skipped"] == []
+    assert digest(original) == before and {path.name for path in source.iterdir()} == source_names
+    assert {path.name for path in output.iterdir()} == {output_name}
+    assert {path.name for path in reports.iterdir()} == {"sanitize.json"}
+    for path in (output / output_name, reports / "sanitize.json"):
+        assert path.is_file() and path.stat().st_uid == 10001
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    # Return only check statuses from the synthetic report, not its document-derived content.
+    script = ("import json,sys; "
+              "checks=json.load(open(sys.argv[1]))['sanitize']['checks']; "
+              "print(json.dumps({key:checks[key]['status'] for key in sys.argv[2:]}))")
+    verified = docker_run(["-c", script, "/work/report/sanitize.json", *checks],
+                          mounts, entrypoint="python")
+    assert verified.returncode == 0 and verified.stderr == "", verified.stderr
+    assert json.loads(verified.stdout) == checks
+    if name == "zero-width.txt":
+        content = docker_run(["-c", ("from pathlib import Path; "
+                                      "assert Path('/work/out/text.sanitized.txt').read_text()"
+                                      " == 'holamundo\\n'")],
+                             mounts, entrypoint="python")
+        assert (content.returncode, content.stdout, content.stderr) == (0, "", "")
+
+
 def test_tools_and_runtime_settings(image_available):
     script = ("import json,os,shutil; print(json.dumps({"
               "'exiftool':shutil.which('exiftool'),'c2patool':shutil.which('c2patool'),"
+              "'soffice':shutil.which('soffice'),"
               "'home':os.environ.get('HOME'),'tmp':os.environ.get('TMPDIR'),"
               "'npm':os.environ.get('NPM_CONFIG_CACHE'),'xdg':os.environ.get('XDG_CACHE_HOME'),"
               "'no_netns':os.environ.get('DOC_SENTINEL_NO_NETNS')}))")
@@ -177,8 +230,18 @@ def test_tools_and_runtime_settings(image_available):
     settings = json.loads(proc.stdout)
     expected_c2patool = None if image_available == "arm64" else "/usr/local/bin/c2patool"
     assert settings == {"exiftool": "/usr/bin/exiftool", "c2patool": expected_c2patool,
-                        "home": "/tmp", "tmp": "/tmp", "npm": "/tmp/.npm",
-                        "xdg": "/tmp/.cache", "no_netns": None}
+                        "soffice": "/usr/bin/soffice", "home": "/tmp", "tmp": "/tmp",
+                        "npm": "/tmp/.npm", "xdg": "/tmp/.cache", "no_netns": None}
+
+
+def test_runtime_node_without_build_tools():
+    script = ("import json,shutil,sys; print(json.dumps({"
+              "'node':shutil.which('node'),'npm':shutil.which('npm'),"
+              "'uv':shutil.which('uv'),'venv':sys.prefix}))")
+    proc = docker_run(["-c", script], entrypoint="python")
+    assert proc.returncode == 0 and proc.stderr == ""
+    assert json.loads(proc.stdout) == {"node": "/usr/local/bin/node", "npm": None,
+                                      "uv": None, "venv": "/opt/venv"}
 
 
 def test_c2patool_executes(image_available):

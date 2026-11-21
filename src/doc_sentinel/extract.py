@@ -159,7 +159,8 @@ def _archive(src: Path, dtype: str, channels: list[Channel]) -> None:
 
 
 def _pdf(src: Path, channels: list[Channel]) -> None:
-    import pymupdf
+    from doc_sentinel._pymupdf import load as _load_pymupdf
+    pymupdf = _load_pymupdf()
 
     with pymupdf.open(src) as pdf:
         if len(pdf) > _MAX_PAGES:
