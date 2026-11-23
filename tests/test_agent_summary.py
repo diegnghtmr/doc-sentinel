@@ -143,3 +143,91 @@ def test_json_and_agent_summary_are_mutually_exclusive(scratch, capsys):
     stdout, stderr = capsys.readouterr()
     assert exc.value.code == 2 and stdout == "" and "not allowed with argument" in stderr
     assert src.read_bytes() == before
+
+
+def _finding(cls, severity, *, channel="body", page=None, hidden=None):
+    evidence = {} if hidden is None else {"hidden": hidden}
+    return {"class": cls, "severity": severity, "adapter": "instruction-phrases",
+            "location": {"file": "x", "channel": channel, "page": page, "pointer": None},
+            "excerpt": "HOSTILE_EXCERPT", "evidence": evidence}
+
+
+def test_overview_groups_findings_by_kind_without_document_text():
+    from doc_sentinel.agent_summary import make_summary
+
+    findings = [
+        _finding("prompt_injection", "high", page=2),
+        _finding("prompt_injection", "critical", page=3, hidden=True),
+        _finding("prompt_injection", "critical", page=1, hidden=True),
+        _finding("hidden_text", "high", page=1),
+        _finding("prompt_injection", "high", page=2),
+        _finding("prompt_injection", "HOSTILE_SEVERITY"),
+        _finding("HOSTILE_CLASS", "high"),
+        _finding("prompt_injection", "medium", page="HOSTILE_PAGE", hidden="HOSTILE"),
+        _finding("prompt_injection", "medium", page=True),
+        _finding("metadata_injection", "high", channel="metadata"),
+        _finding("prompt_injection", "high", channel="HOSTILE_CHANNEL"),
+    ]
+    safe = make_summary({"verdict": "findings", "findings": findings}, mode="detect",
+                        exit_code=1, input_path="in.docx", output_path=None, report_path="r.json")
+    assert safe["overview"] == [
+        {"class": "prompt_injection", "severity": "critical", "visibility": "hidden",
+         "channel": "body", "count": 2, "pages": [1, 3]},
+        {"class": "hidden_text", "severity": "high", "visibility": "hidden",
+         "channel": "body", "count": 1, "pages": [1]},
+        {"class": "metadata_injection", "severity": "high", "visibility": "hidden",
+         "channel": "metadata", "count": 1, "pages": []},
+        {"class": "prompt_injection", "severity": "high", "visibility": "visible",
+         "channel": "body", "count": 2, "pages": [2]},
+        {"class": "prompt_injection", "severity": "medium", "visibility": "visible",
+         "channel": "body", "count": 2, "pages": []},
+    ]
+    assert "HOSTILE" not in json.dumps(safe)
+
+
+def test_explanations_cover_only_classes_found():
+    from doc_sentinel.agent_summary import EXPLANATIONS, make_summary
+
+    findings = [_finding("hidden_text", "high"), _finding("prompt_injection", "high")]
+    safe = make_summary({"verdict": "findings", "findings": findings}, mode="detect",
+                        exit_code=1, input_path="in.docx", output_path=None, report_path=None)
+    assert set(safe["explanations"]) == {"hidden_text", "prompt_injection"}
+    assert safe["explanations"]["hidden_text"] == EXPLANATIONS["hidden_text"]
+    from doc_sentinel.schema import CLASSES
+    assert set(EXPLANATIONS) == set(CLASSES)
+
+
+@pytest.mark.parametrize("mode,verdict,sanitize,expected", [
+    ("detect", "findings", None, ["sanitized_copy", "clean_metadata"]),
+    ("review-merge", "findings", None, ["sanitized_copy", "clean_metadata"]),
+    ("detect", "clean", None, ["clean_metadata"]),
+    ("detect", "findings", {"status": "sanitized", "actions": []}, []),
+    ("clean", "cleaned", None, []),
+    ("detect", "error", None, []),
+])
+def test_next_steps_depend_on_outcome(mode, verdict, sanitize, expected):
+    from doc_sentinel.agent_summary import make_summary
+
+    report = {"verdict": verdict, "findings": []}
+    if sanitize:
+        report["sanitize"] = sanitize
+    safe = make_summary(report, mode=mode, exit_code=1, input_path="in.docx",
+                        output_path=None, report_path=None)
+    assert [step["id"] for step in safe["next_steps"]] == expected
+    assert all(set(step) == {"id", "description"} for step in safe["next_steps"])
+
+
+@pytest.mark.parametrize("bad", [
+    {"class": ["x"]}, {"class": {"x": 1}}, {"severity": {}}, {"severity": ["high"]},
+    {"location": {"channel": [1], "page": 1}}, {"location": ["body"]}, {"evidence": ["hidden"]},
+    {"location": {"channel": "body", "page": 10 ** 400}}, {"location": {"channel": "body", "page": -3}},
+])
+def test_hostile_types_never_crash_or_leak(bad):
+    from doc_sentinel.agent_summary import make_summary
+
+    finding = {**_finding("hidden_text", "high", page=4), **bad}
+    safe = make_summary({"verdict": "findings", "findings": [finding]}, mode="detect",
+                        exit_code=1, input_path="in.docx", output_path=None, report_path=None)
+    for group in safe["overview"]:
+        assert all(type(page) is int and 0 < page <= 99_999 for page in group["pages"])
+    assert len(json.dumps(safe)) < 5000

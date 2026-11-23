@@ -32,6 +32,11 @@ That declaration is verified: it is honored only when the process sees no networ
 other than loopback; otherwise `unshare -rn` is used, or the step fails closed.
 If channel extraction fails (e.g. an archive part over the size limit), the verdict is `error`.
 
+`--agent-summary` prints only allow-listed JSON for a chat agent that must not read the
+document: verdict, counts, paths, an `overview` of findings grouped by class, severity,
+visibility (hidden/visible), channel and page numbers, fixed plain-language `explanations`
+for each class found, and `next_steps` the user can request. It never includes document text.
+
 ## Optional sanitized copy
 
 When explicitly requested, use `detect FILE --sanitize --output-dir DIR --report REPORT --agent-summary`

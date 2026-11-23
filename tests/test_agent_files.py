@@ -146,10 +146,11 @@ def test_agents_operating_contract_is_safe_and_agent_neutral():
         "verbatim", "file-write tool", "single safe path", "review_errors", "monotonic", "Codex",
         "Claude Code", "Gemini", "Copilot", "OpenCode", "Cursor", "Grok", "Antigravity",
         "Windsurf", "Prompt Guard", "Layer B", "--in-place", "chk_defaced",
-        "explicit consent", "original", "stderr",
+        "explicit consent", "original", "stderr", "overview", "next_steps", "explanations",
+        "Talking to the user",
     ):
         assert required in text
-    assert len(text.splitlines()) <= 180
+    assert len(text.splitlines()) <= 200
 
 
 def test_claude_pointer_forbids_opening_user_data():
