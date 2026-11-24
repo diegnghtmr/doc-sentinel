@@ -127,6 +127,7 @@ def test_agents_uses_only_the_s13_s14_command_flows():
         ("detect", frozenset({"--sanitize", "--output-dir", "--report", "--agent-summary"})),
         ("sanitize", frozenset({"--review-dir", "--output-dir", "--report", "--agent-summary"})),
         ("review-merge", frozenset({"--review-dir", "--report", "--agent-summary"})),
+        ("review-run", frozenset({"--review-dir", "--reviewer", "--json"})),
         ("clean", frozenset({"--output-dir", "--report", "--agent-summary"})),
         ("update", frozenset({"--json"})),
     }
