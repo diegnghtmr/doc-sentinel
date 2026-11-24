@@ -149,7 +149,28 @@ fi
 
 script_dir=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P) || fail 'cannot locate launcher'
 repo=$(dirname "$script_dir")
-if [ "$rebuild" -eq 1 ] || ! docker image inspect doc-sentinel:local >/dev/null 2>&1; then
+# Record which commit built the image in a local stamp (some engines drop image labels),
+# so a stale image is rebuilt after a pull. Uncommitted changes always rebuild and leave
+# no stamp. Without git, an existing image is reused.
+source_label=''; stamp="$repo/.cache/doc-sentinel-image"
+if command -v git >/dev/null 2>&1 && [ "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" = "$repo" ]     && head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) && [ -n "$head" ]; then
+    # Build inputs only (see containers/Dockerfile), including untracked files.
+    if changes=$(git -C "$repo" status --porcelain -- src third_party containers pyproject.toml         README.md LICENSE pins.lock.json 2>/dev/null) && [ -z "$changes" ]; then
+        source_label=$head
+    else
+        rebuild=1
+    fi
+fi
+if image_id=$(docker image inspect --format '{{.Id}}' doc-sentinel:local 2>/dev/null); then
+    if [ -n "$source_label" ]; then
+        recorded=''
+        if [ -f "$stamp" ]; then read -r recorded < "$stamp" || :; fi
+        [ "$recorded" = "$source_label $image_id" ] || rebuild=1
+    fi
+else
+    rebuild=1
+fi
+if [ "$rebuild" -eq 1 ]; then
     [ -f "$repo/containers/Dockerfile" ] || fail "Dockerfile not found: $repo/containers/Dockerfile"
     found=0
     for dir in "$repo"/third_party/*; do
@@ -162,9 +183,18 @@ if [ "$rebuild" -eq 1 ] || ! docker image inspect doc-sentinel:local >/dev/null 
         [ "$populated" -eq 1 ] || fail 'run: git submodule update --init --recursive'
     done
     [ "$found" -eq 1 ] || fail 'run: git submodule update --init --recursive'
+    if [ -f "$stamp" ]; then { true > "$stamp"; } 2>/dev/null || :; fi
+    # Retry once: some BuildKit setups intermittently fail to resolve base images.
     docker build -f "$repo/containers/Dockerfile" -t doc-sentinel:local "$repo" 1>&2
     build_code=$?
+    if [ "$build_code" -ne 0 ]; then
+        docker build -f "$repo/containers/Dockerfile" -t doc-sentinel:local "$repo" 1>&2
+        build_code=$?
+    fi
     [ "$build_code" -eq 0 ] || exit "$build_code"
+    if [ -n "$source_label" ] && image_id=$(docker image inspect --format '{{.Id}}' doc-sentinel:local 2>/dev/null); then
+        { mkdir -p "$repo/.cache" && printf '%s %s\n' "$source_label" "$image_id" > "$stamp"; } 2>/dev/null || :
+    fi
 fi
 
 # Save intent/version arguments as positional parameters, then prepend Docker arguments.

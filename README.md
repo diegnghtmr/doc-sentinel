@@ -140,7 +140,10 @@ exiftool, c2patool and headless LibreOffice (needed by the DOCX/PDF sanitize ren
 It never contains your documents (`.dockerignore`) and runs as uid 10001 with no network,
 a read-only root, `/tmp` as tmpfs, all capabilities dropped and `no-new-privileges`.
 
-The launchers build the image on first use and pass the same arguments as the CLI:
+The launchers build the image on first use and pass the same arguments as the CLI. In a git
+checkout they record the commit that built the image in `.cache/doc-sentinel-image` and
+rebuild after a pull or with uncommitted changes, so agents never run an outdated scanner;
+`--rebuild` (`-Rebuild` on Windows) forces a rebuild:
 
 ```bash
 scripts/doc-sentinel-docker.sh detect inbox/file.pdf --agent-summary --report reports/file.json

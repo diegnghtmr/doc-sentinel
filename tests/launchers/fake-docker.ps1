@@ -15,6 +15,7 @@ if ($dockerArgs.Count -ge 1 -and $dockerArgs[0] -eq 'info') {
     }
 } elseif ($dockerArgs.Count -ge 2 -and $dockerArgs[0] -eq 'image' -and $dockerArgs[1] -eq 'inspect') {
     if ($env:FAKE_IMAGE_CODE) { $code = [int]$env:FAKE_IMAGE_CODE }
+    if ($code -eq 0 -and $dockerArgs -contains '--format') { if ($env:FAKE_IMAGE_ID) { [Console]::Out.WriteLine($env:FAKE_IMAGE_ID) } else { [Console]::Out.WriteLine('sha256:fake') } }
 } elseif ($dockerArgs.Count -ge 1 -and $dockerArgs[0] -eq 'build') {
     [Console]::Out.WriteLine('build stdout')
     [Console]::Error.WriteLine('build stderr')

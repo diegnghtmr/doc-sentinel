@@ -44,6 +44,9 @@ class Harness:
         fake = ROOT / "tests" / "launchers" / ("fake-docker.py" if backend == "sh" else "fake-docker.ps1")
         shutil.copyfile(fake, self.bin / "docker")
         (self.bin / "docker").chmod(0o755)
+        fake_git = ROOT / "tests" / "launchers" / ("fake-git.py" if backend == "sh" else "fake-git.ps1")
+        shutil.copyfile(fake_git, self.bin / "git")
+        (self.bin / "git").chmod(0o755)
         self.input_dir = root / "input docs"
         self.output_dir = root / "output docs"
         self.report_dir = root / "reports here"
@@ -422,6 +425,53 @@ class LauncherScenarios:
                                                   "-t", IMAGE, harness.path(harness.repo)]]
         assert harness.calls_named("run")
 
+    def stamp(self, harness):
+        return harness.repo / ".cache" / "doc-sentinel-image"
+
+    def test_image_from_another_commit_is_rebuilt_and_recorded(self, harness):
+        self.stamp(harness).parent.mkdir()
+        self.stamp(harness).write_text("oldcommit sha256:fake")
+        harness.config.update(FAKE_GIT_HEAD="newcommit", FAKE_IMAGE_ID="sha256:built")
+        result = harness.run("version")
+        assert result.returncode == 0
+        assert len(harness.calls_named("build")) == 1 and harness.calls_named("run")
+        assert self.stamp(harness).read_text().strip() == "newcommit sha256:built"
+
+    def test_image_recorded_for_current_commit_is_reused(self, harness):
+        self.stamp(harness).parent.mkdir()
+        self.stamp(harness).write_text("samecommit sha256:fake")
+        harness.config.update(FAKE_GIT_HEAD="samecommit")
+        result = harness.run("version")
+        assert result.returncode == 0 and not result.stderr
+        assert harness.calls_named("build") == [] and harness.calls_named("run")
+
+    def test_image_replaced_since_recording_is_rebuilt(self, harness):
+        self.stamp(harness).parent.mkdir()
+        self.stamp(harness).write_text("samecommit sha256:other")
+        harness.config.update(FAKE_GIT_HEAD="samecommit")
+        assert harness.run("version").returncode == 0
+        assert len(harness.calls_named("build")) == 1
+
+    def test_without_git_existing_image_is_reused(self, harness):
+        result = harness.run("version")
+        assert result.returncode == 0
+        assert harness.calls_named("build") == [] and harness.calls_named("run")
+
+    def test_enclosing_repository_is_not_mistaken_for_the_scanner(self, harness):
+        harness.config.update(FAKE_GIT_HEAD="parentcommit", FAKE_GIT_TOPLEVEL="/somewhere/else",
+                              FAKE_GIT_DIRTY=" M notes.txt")
+        result = harness.run("version")
+        assert result.returncode == 0
+        assert harness.calls_named("build") == [] and not self.stamp(harness).exists()
+
+    def test_uncommitted_changes_always_rebuild_without_recording(self, harness):
+        self.stamp(harness).parent.mkdir()
+        self.stamp(harness).write_text("samecommit sha256:fake")
+        harness.config.update(FAKE_GIT_HEAD="samecommit", FAKE_GIT_DIRTY=" M src/doc_sentinel/cli.py")
+        assert harness.run("version").returncode == 0
+        assert len(harness.calls_named("build")) == 1
+        assert self.stamp(harness).read_text() == ""
+
     def test_missing_submodule_refuses_build(self, harness):
         (harness.repo / "third_party" / "one" / "source").unlink()
         harness.config["FAKE_IMAGE_CODE"] = "1"
@@ -434,6 +484,7 @@ class LauncherScenarios:
         harness.config.update(FAKE_IMAGE_CODE="1", FAKE_BUILD_CODE="7")
         result = harness.run("version")
         assert result.returncode == 7 and result.stdout == ""
+        assert len(harness.calls_named("build")) == 2
         assert "build stdout\n" in result.stderr and "build stderr\n" in result.stderr
         assert not harness.calls_named("run")
 

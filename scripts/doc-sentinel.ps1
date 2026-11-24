@@ -310,14 +310,56 @@ function Invoke-Launcher([string[]]$Arguments) {
     try { $docker = Initialize-Docker -Windows $windowsHost -TimeoutSeconds $timeout }
     catch { Write-LauncherError $_.Exception.Message; return 2 }
     $repo = Split-Path -Parent $PSScriptRoot
-    if (-not $rebuild) { & $docker image inspect doc-sentinel:local >$null 2>$null; $rebuild = $LASTEXITCODE -ne 0 }
+    # Record which commit built the image in a local stamp (some engines drop image labels),
+    # so a stale image is rebuilt after a pull. Uncommitted changes always rebuild and leave
+    # no stamp. Without git, an existing image is reused.
+    $sourceLabel = ''
+    $stamp = Join-Path (Join-Path $repo '.cache') 'doc-sentinel-image'
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $top = ''
+    if ($git) {
+        $top = (@(& $git -C $repo rev-parse --show-toplevel 2>$null) -join '').Trim()
+        if ($LASTEXITCODE -ne 0) { $top = '' }
+    }
+    if ($top -and (Test-SamePath -First ([IO.Path]::GetFullPath($top).TrimEnd([char[]]'\/')) -Second ([IO.Path]::GetFullPath($repo).TrimEnd([char[]]'\/')) -Windows $windowsHost)) {
+        $head = @(& $git -C $repo rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $head.Count -gt 0 -and ([string]$head[0]).Trim()) {
+            # Build inputs only (see containers/Dockerfile), including untracked files.
+            $dirty = (@(& $git -C $repo status --porcelain -- src third_party containers pyproject.toml README.md LICENSE pins.lock.json 2>$null) -join '').Trim()
+            if ($LASTEXITCODE -ne 0 -or $dirty) { $rebuild = $true }
+            else { $sourceLabel = ([string]$head[0]).Trim() }
+        }
+    }
+    $imageId = (@(& $docker image inspect --format '{{.Id}}' doc-sentinel:local 2>$null) -join '').Trim()
+    if ($LASTEXITCODE -ne 0) { $rebuild = $true }
+    elseif ($sourceLabel) {
+        $recorded = ''
+        if (Test-Path -LiteralPath $stamp -PathType Leaf) {
+            $recorded = (@(Get-Content -LiteralPath $stamp -ErrorAction SilentlyContinue) -join '').Trim()
+        }
+        if ($recorded -ne "$sourceLabel $imageId") { $rebuild = $true }
+    }
     if ($rebuild) {
         $dockerfile = Join-Path (Join-Path $repo 'containers') 'Dockerfile'
         if (-not (Test-Path -LiteralPath $dockerfile -PathType Leaf)) { Write-LauncherError "Dockerfile not found: $dockerfile"; return 2 }
         if (-not (Test-SubmodulesPopulated -Repo $repo)) { Write-LauncherError 'run: git submodule update --init --recursive'; return 2 }
+        if (Test-Path -LiteralPath $stamp -PathType Leaf) {
+            try { Set-Content -LiteralPath $stamp -Value '' -NoNewline -ErrorAction Stop } catch { }
+        }
         $buildArgs = @('build', '-f', $dockerfile, '-t', 'doc-sentinel:local', $repo)
+        # Retry once: some BuildKit setups intermittently fail to resolve base images.
         & $docker @buildArgs 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) }
+        if ($LASTEXITCODE -ne 0) { & $docker @buildArgs 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) } }
         if ($LASTEXITCODE -ne 0) { return $LASTEXITCODE }
+        if ($sourceLabel) {
+            $imageId = (@(& $docker image inspect --format '{{.Id}}' doc-sentinel:local 2>$null) -join '').Trim()
+            if ($LASTEXITCODE -eq 0 -and $imageId) {
+                try {
+                    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stamp) -ErrorAction Stop | Out-Null
+                    [IO.File]::WriteAllText($stamp, "$sourceLabel $imageId`n")
+                } catch { }
+            }
+        }
     }
     $hostIsLinux = -not $windowsHost -and (& uname -s) -eq 'Linux'
     $user = if ($hostIsLinux) { "$(id -u):$(id -g)" } else { '' }

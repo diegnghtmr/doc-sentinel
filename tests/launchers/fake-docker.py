@@ -15,6 +15,8 @@ if args[:1] == ['info']:
         print(os.environ.get('FAKE_OSTYPE', 'linux'))
 elif args[:2] == ['image', 'inspect']:
     code = int(os.environ.get('FAKE_IMAGE_CODE', '0'))
+    if code == 0 and '--format' in args:
+        print(os.environ.get('FAKE_IMAGE_ID', 'sha256:fake'))
 elif args[:1] == ['build']:
     print('build stdout', flush=True)
     print('build stderr', file=sys.stderr, flush=True)
