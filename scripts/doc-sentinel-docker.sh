@@ -3,11 +3,12 @@
 
 usage() {
     printf '%s\n' \
-        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,sanitize,review-merge,version,intent} ...' \
+        'usage: doc-sentinel-docker.sh [--rebuild] {clean,detect,sanitize,review-merge,review-run,version,intent} ...' \
         '  clean FILE [-o PATH | --output-dir DIR] [--force-output] [--json|--agent-summary] [--report PATH]' \
         '  detect FILE [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--agent-summary] [--review-dir DIR]' \
         '  sanitize FILE --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]' \
-        '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'  \
+        '  review-merge --review-dir DIR [--report PATH] [--agent-summary]' \
+        '  review-run --review-dir DIR --reviewer {opencode,claude,gemini} [--model M] [--json]   (host Python, no Docker)' \
         '  version | intent TEXT...' \
         '  update and --allow-network require the Python CLI on the host.'
 }
@@ -32,6 +33,12 @@ if [ "${1-}" = '--rebuild' ]; then rebuild=1; shift; fi
 case "$1" in
     --help|-h) usage; exit 0 ;;
     update) fail 'update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)' ;;
+    review-run)
+        # Host-only: needs the reviewer CLI and its network; the runner is stdlib-only.
+        shift
+        command -v python3 >/dev/null 2>&1 || fail 'review-run needs Python 3 on the host (python3)'
+        run_dir=$(CDPATH='' cd -P -- "$(dirname "$0")/.." && pwd -P) || fail 'cannot locate launcher'
+        exec python3 -I "$run_dir/src/doc_sentinel/review_run.py" "$@" ;;
     clean|detect|sanitize|review-merge|version|intent) mode=$1; shift ;;
     *) fail "unknown command: $1" ;;
 esac

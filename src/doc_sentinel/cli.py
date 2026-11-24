@@ -109,6 +109,11 @@ def _parser() -> argparse.ArgumentParser:
     merge.add_argument("--agent-summary", action="store_true",
                        help="print only the orchestrator-safe JSON summary on stdout")
 
+    review_run = sub.add_parser("review-run",
+                                help="answer review batches with a tool-less model CLI (host only)")
+    from doc_sentinel.review_run import add_arguments as add_review_run_arguments
+    add_review_run_arguments(review_run)
+
     update = sub.add_parser("update", help="move pins to the latest main, roll back on failure")
     update.add_argument("--dry-run", action="store_true",
                         help="report what would change without moving any pin")
@@ -323,6 +328,10 @@ def main(argv: list[str] | None = None) -> int:
             report, code = merge(root, plan, original)
             _emit(report, args, report_target, code, public_review(root, plan))
             return code
+        if args.command == "review-run":
+            from doc_sentinel.review_run import execute
+
+            return execute(args)
         if args.command == "update":
             from doc_sentinel.update import run_update
 

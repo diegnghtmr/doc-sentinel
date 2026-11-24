@@ -47,6 +47,9 @@ class Harness:
         fake_git = ROOT / "tests" / "launchers" / ("fake-git.py" if backend == "sh" else "fake-git.ps1")
         shutil.copyfile(fake_git, self.bin / "git")
         (self.bin / "git").chmod(0o755)
+        fake_python = ROOT / "tests" / "launchers" / ("fake-python.py" if backend == "sh" else "fake-python.ps1")
+        shutil.copyfile(fake_python, self.bin / "python3")
+        (self.bin / "python3").chmod(0o755)
         self.input_dir = root / "input docs"
         self.output_dir = root / "output docs"
         self.report_dir = root / "reports here"
@@ -487,6 +490,17 @@ class LauncherScenarios:
         assert harness.run("version").returncode == 0
         assert len(harness.calls_named("build")) == 1
         assert self.stamp(harness).read_text() == ""
+
+    def test_review_run_uses_host_python_and_never_docker(self, harness):
+        harness.config.update(FAKE_PYTHON_STDOUT='{"answered": []}', FAKE_PYTHON_CODE="1")
+        review = harness.root / "review dir"
+        result = harness.run("review-run", "--review-dir", review, "--reviewer", "claude", "--json")
+        assert (result.returncode, result.stdout) == (1, '{"answered": []}')
+        script = harness.path(harness.repo / "src" / "doc_sentinel" / "review_run.py")
+        runs = [call["args"] for call in harness.calls() if "-c" not in call["args"]]
+        assert runs == [["python", "-I", script, "--review-dir", harness.path(review),
+                         "--reviewer", "claude", "--json"]]
+        assert all(call["args"][0] == "python" for call in harness.calls())
 
     def test_missing_submodule_refuses_build(self, harness):
         (harness.repo / "third_party" / "one" / "source").unlink()

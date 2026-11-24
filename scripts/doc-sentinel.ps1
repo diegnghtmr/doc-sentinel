@@ -62,11 +62,12 @@ function New-DockerRunArguments(
 function Write-LauncherError([string]$Message) { [Console]::Error.WriteLine($Message) }
 function Show-Usage {
     @(
-        'usage: doc-sentinel.ps1 [-Rebuild] [-StartTimeoutSeconds N] {clean,detect,sanitize,review-merge,version,intent} ...'
+        'usage: doc-sentinel.ps1 [-Rebuild] [-StartTimeoutSeconds N] {clean,detect,sanitize,review-merge,review-run,version,intent} ...'
         '  clean FILE [-o PATH | --output-dir DIR] [--force-output] [--json|--agent-summary] [--report PATH]'
         '  detect FILE [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--agent-summary] [--review-dir DIR]'
         '  sanitize FILE --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]'
         '  review-merge --review-dir DIR [--report PATH] [--agent-summary]'
+        '  review-run --review-dir DIR --reviewer {opencode,claude,gemini} [--model M] [--json]   (host Python, no Docker)'
         '  version | intent TEXT...'
         '  update and --allow-network require the Python CLI on the host.'
     ) | ForEach-Object { [Console]::Out.WriteLine($_) }
@@ -164,6 +165,26 @@ function Test-SubmodulesPopulated([string]$Repo) {
 
 if (($args.Count -gt 0 -and $args[0] -eq '-NoMain') -or $env:DOC_SENTINEL_LAUNCHER_TEST -eq '1') { return }
 
+# Semantic review runs on the host: it needs the reviewer CLI and its network access,
+# which the offline container must not have. The runner is stdlib-only (python -I).
+function Invoke-ReviewRun([string[]]$Arguments) {
+    $python = $null; $prefix = @()
+    # Probe each candidate: Windows' Microsoft Store alias stubs are not Python.
+    foreach ($name in @('py', 'python3', 'python')) {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) { continue }
+        $probe = @(); if ($name -eq 'py') { $probe = @('-3') }
+        $probeArgs = $probe + @('-I', '-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)')
+        & $command @probeArgs *> $null
+        if ($LASTEXITCODE -eq 0) { $python = $command; $prefix = $probe; break }
+    }
+    if (-not $python) { Write-LauncherError 'review-run needs Python 3 on the host (python3, python or py)'; return 2 }
+    $script = Join-Path (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'src') 'doc_sentinel') 'review_run.py'
+    $pythonArgs = @($prefix) + @('-I', $script) + @($Arguments)
+    # Run it at script scope (see below) so its stdout and exit code reach the caller.
+    $script:RunSpec = @{ Docker = $python.Source; Arguments = $pythonArgs; Mode = 'review-run'; Output = ''; DefaultCleanOutput = '' }
+    return 0
+}
 function Invoke-Launcher([string[]]$Arguments) {
     $windowsHost = $env:OS -eq 'Windows_NT'
     $rebuild = $false; $timeout = 180; $index = 0
@@ -183,6 +204,10 @@ function Invoke-Launcher([string[]]$Arguments) {
     if ($mode -eq '--help' -or $mode -eq '-h') { Show-Usage; return 0 }
     if ($mode -eq 'update') {
         Write-LauncherError 'update runs on a git checkout with network: use the Python CLI on the host (doc-sentinel update)'; return 2
+    }
+    if ($mode -eq 'review-run') {
+        $rest = @(); if ($index -lt $Arguments.Count) { $rest = @($Arguments[$index..($Arguments.Count - 1)]) }
+        return Invoke-ReviewRun $rest
     }
     if (@('clean', 'detect', 'sanitize', 'review-merge', 'version', 'intent') -cnotcontains $mode) {
         Write-LauncherError "unknown command: $mode"; return 2

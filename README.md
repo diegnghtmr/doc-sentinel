@@ -10,6 +10,7 @@ doc-sentinel clean  <file> [-o PATH | --output-dir DIR] [--force-output] [--json
 doc-sentinel detect <file> [--sanitize [-o PATH | --output-dir DIR] [--force-output]] [--json|--agent-summary] [--report PATH] [--review-dir DIR] [--allow-network] [--fail-on high|medium] [--prompt-guard]
 doc-sentinel sanitize <file> --review-dir DIR [-o PATH | --output-dir DIR] [--force-output] [--report PATH] [--agent-summary]
 doc-sentinel review-merge --review-dir DIR [--report PATH] [--agent-summary]
+doc-sentinel review-run --review-dir DIR --reviewer opencode|claude|gemini [--model M] [--json]   # host only
 doc-sentinel update [--dry-run] [--only ID] [--json]
 doc-sentinel version
 doc-sentinel intent "<natural-language request>"   # -> clean | detect | update | detect+clean
@@ -47,6 +48,13 @@ path rather than predicting a name: a filename injection selects `sanitized-docu
 (or `sanitized-document.docx` for PDF). An explicit output that reuses the injection-bearing
 input name is refused, and the separate report records that the original name was not reused.
 For PDF input the output is a reconstructed `<stem>.sanitized.docx`; `-o` must end in `.docx`.
+When the chat app cannot start a read-only reviewer subagent (e.g. Antigravity),
+`review-run` answers the batches itself: it pipes each batch to `opencode run` with an agent
+whose every permission is denied (default model `github-copilot/auto`), to
+`claude -p --tools ""`, or to `gemini -p` under a deny-all admin policy, in an empty
+temporary directory, and writes the
+raw reply to `answers/<batch_id>.json` for `review-merge` to validate. It runs on the host
+(the Docker launchers call host Python) because the reviewer CLI needs network access.
 After semantic review and `review-merge`, use `sanitize FILE --review-dir DIR --report
 REPORT --agent-summary`; the original input is mounted again and its SHA-256 must match
 the review plan. The detect verdict remains the original document's verdict. A refused
