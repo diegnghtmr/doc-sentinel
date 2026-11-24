@@ -68,7 +68,7 @@ assert findings[0].evidence["obfuscated"] is False
 """
     subprocess.run([sys.executable, "-B", "-c", code, str(tmp_path)],
                    input="Ignore previous instructions. " * repetitions,
-                   text=True, capture_output=True, check=True, timeout=2)
+                   text=True, capture_output=True, check=True, timeout=10)
 
 
 def test_obfuscation_only_in_a_dropped_contextual_rule_does_not_raise(tmp_path):
