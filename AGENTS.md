@@ -174,7 +174,9 @@ that cannot ask for approval) and how to fix it: switch to a mode that asks for 
 or allow doc-sentinel for this folder, then repeat the request. Never suggest a terminal.
 Deliver the result in the reply that finishes the work, translated, from the safe summary
 only; the user must never have to ask what you found or open the JSON report:
-1. **Verdict** in one plain sentence, and whether semantic review ran.
+1. **Verdict** in one plain sentence. If semantic review was skipped, add one short line with
+   no technical reasons (isolation, reviewers, batches, consent), e.g. «Se usó el análisis
+   automático; la revisión adicional con IA no está disponible en esta app.»
 2. **What was found**: one bullet per `overview` group: count, kind in plain words
    (`explanations`), severity, hidden or visible, where (`channel`, `pages` if any).
 3. **What it means**, in one or two sentences from `explanations`.
