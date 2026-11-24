@@ -151,11 +151,16 @@ script_dir=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P) || fail 'cannot loc
 repo=$(dirname "$script_dir")
 # Record which commit built the image in a local stamp (some engines drop image labels),
 # so a stale image is rebuilt after a pull. Uncommitted changes always rebuild and leave
-# no stamp. Without git, an existing image is reused.
+# no stamp. Without git, an existing image is reused. Refreshing a stale image is best
+# effort: if it cannot be built (e.g. a worktree without submodules), the existing image
+# is used with a warning. A missing image or --rebuild must build.
+required=$rebuild
 source_label=''; stamp="$repo/.cache/doc-sentinel-image"
-if command -v git >/dev/null 2>&1 && [ "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" = "$repo" ]     && head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) && [ -n "$head" ]; then
+if command -v git >/dev/null 2>&1 && [ "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" = "$repo" ] &&
+    head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) && [ -n "$head" ]; then
     # Build inputs only (see containers/Dockerfile), including untracked files.
-    if changes=$(git -C "$repo" status --porcelain -- src third_party containers pyproject.toml         README.md LICENSE pins.lock.json 2>/dev/null) && [ -z "$changes" ]; then
+    if changes=$(git -C "$repo" status --porcelain -- src third_party containers pyproject.toml \
+        README.md LICENSE pins.lock.json 2>/dev/null) && [ -z "$changes" ]; then
         source_label=$head
     else
         rebuild=1
@@ -168,11 +173,12 @@ if image_id=$(docker image inspect --format '{{.Id}}' doc-sentinel:local 2>/dev/
         [ "$recorded" = "$source_label $image_id" ] || rebuild=1
     fi
 else
-    rebuild=1
+    rebuild=1; required=1
 fi
+stale_warning='doc-sentinel: could not refresh the outdated image; using the existing one'
 if [ "$rebuild" -eq 1 ]; then
     [ -f "$repo/containers/Dockerfile" ] || fail "Dockerfile not found: $repo/containers/Dockerfile"
-    found=0
+    found=0; populated_all=1
     for dir in "$repo"/third_party/*; do
         [ -d "$dir" ] || continue
         found=1; populated=0
@@ -180,9 +186,16 @@ if [ "$rebuild" -eq 1 ]; then
             [ "$(basename "$entry")" = .git ] && continue
             if [ -e "$entry" ] || [ -L "$entry" ]; then populated=1; break; fi
         done
-        [ "$populated" -eq 1 ] || fail 'run: git submodule update --init --recursive'
+        [ "$populated" -eq 1 ] || populated_all=0
     done
-    [ "$found" -eq 1 ] || fail 'run: git submodule update --init --recursive'
+    [ "$found" -eq 1 ] || populated_all=0
+    if [ "$populated_all" -eq 0 ]; then
+        [ "$required" -eq 0 ] || fail 'run: git submodule update --init --recursive'
+        printf '%s (run: git submodule update --init --recursive)\n' "$stale_warning" >&2
+        rebuild=0
+    fi
+fi
+if [ "$rebuild" -eq 1 ]; then
     if [ -f "$stamp" ]; then { true > "$stamp"; } 2>/dev/null || :; fi
     # Retry once: some BuildKit setups intermittently fail to resolve base images.
     docker build -f "$repo/containers/Dockerfile" -t doc-sentinel:local "$repo" 1>&2
@@ -191,8 +204,10 @@ if [ "$rebuild" -eq 1 ]; then
         docker build -f "$repo/containers/Dockerfile" -t doc-sentinel:local "$repo" 1>&2
         build_code=$?
     fi
-    [ "$build_code" -eq 0 ] || exit "$build_code"
-    if [ -n "$source_label" ] && image_id=$(docker image inspect --format '{{.Id}}' doc-sentinel:local 2>/dev/null); then
+    if [ "$build_code" -ne 0 ]; then
+        [ "$required" -eq 0 ] || exit "$build_code"
+        printf '%s (build failed)\n' "$stale_warning" >&2
+    elif [ -n "$source_label" ] && image_id=$(docker image inspect --format '{{.Id}}' doc-sentinel:local 2>/dev/null); then
         { mkdir -p "$repo/.cache" && printf '%s %s\n' "$source_label" "$image_id" > "$stamp"; } 2>/dev/null || :
     fi
 fi

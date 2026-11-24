@@ -457,6 +457,22 @@ class LauncherScenarios:
         assert result.returncode == 0
         assert harness.calls_named("build") == [] and harness.calls_named("run")
 
+    def test_stale_image_is_used_when_submodules_are_missing(self, harness):
+        (harness.repo / "third_party" / "one" / "source").unlink()
+        harness.config.update(FAKE_GIT_HEAD="newcommit")
+        result = harness.run("version")
+        assert result.returncode == 0 and result.stdout == ""
+        assert "could not refresh the outdated image" in result.stderr
+        assert harness.calls_named("build") == [] and harness.calls_named("run")
+
+    def test_stale_image_is_used_when_rebuild_fails(self, harness):
+        harness.config.update(FAKE_GIT_HEAD="newcommit", FAKE_BUILD_CODE="7")
+        result = harness.run("version")
+        assert result.returncode == 0
+        assert "could not refresh the outdated image" in result.stderr
+        assert len(harness.calls_named("build")) == 2 and harness.calls_named("run")
+        assert not self.stamp(harness).exists()
+
     def test_enclosing_repository_is_not_mistaken_for_the_scanner(self, harness):
         harness.config.update(FAKE_GIT_HEAD="parentcommit", FAKE_GIT_TOPLEVEL="/somewhere/else",
                               FAKE_GIT_DIRTY=" M notes.txt")

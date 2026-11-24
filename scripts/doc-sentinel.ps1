@@ -312,7 +312,10 @@ function Invoke-Launcher([string[]]$Arguments) {
     $repo = Split-Path -Parent $PSScriptRoot
     # Record which commit built the image in a local stamp (some engines drop image labels),
     # so a stale image is rebuilt after a pull. Uncommitted changes always rebuild and leave
-    # no stamp. Without git, an existing image is reused.
+    # no stamp. Without git, an existing image is reused. Refreshing a stale image is best
+    # effort: if it cannot be built (e.g. a worktree without submodules), the existing image
+    # is used with a warning. A missing image or -Rebuild must build.
+    $required = $rebuild
     $sourceLabel = ''
     $stamp = Join-Path (Join-Path $repo '.cache') 'doc-sentinel-image'
     $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -331,7 +334,7 @@ function Invoke-Launcher([string[]]$Arguments) {
         }
     }
     $imageId = (@(& $docker image inspect --format '{{.Id}}' doc-sentinel:local 2>$null) -join '').Trim()
-    if ($LASTEXITCODE -ne 0) { $rebuild = $true }
+    if ($LASTEXITCODE -ne 0) { $rebuild = $true; $required = $true }
     elseif ($sourceLabel) {
         $recorded = ''
         if (Test-Path -LiteralPath $stamp -PathType Leaf) {
@@ -339,10 +342,17 @@ function Invoke-Launcher([string[]]$Arguments) {
         }
         if ($recorded -ne "$sourceLabel $imageId") { $rebuild = $true }
     }
+    $staleWarning = 'doc-sentinel: could not refresh the outdated image; using the existing one'
     if ($rebuild) {
         $dockerfile = Join-Path (Join-Path $repo 'containers') 'Dockerfile'
         if (-not (Test-Path -LiteralPath $dockerfile -PathType Leaf)) { Write-LauncherError "Dockerfile not found: $dockerfile"; return 2 }
-        if (-not (Test-SubmodulesPopulated -Repo $repo)) { Write-LauncherError 'run: git submodule update --init --recursive'; return 2 }
+        if (-not (Test-SubmodulesPopulated -Repo $repo)) {
+            if ($required) { Write-LauncherError 'run: git submodule update --init --recursive'; return 2 }
+            [Console]::Error.WriteLine("$staleWarning (run: git submodule update --init --recursive)")
+            $rebuild = $false
+        }
+    }
+    if ($rebuild) {
         if (Test-Path -LiteralPath $stamp -PathType Leaf) {
             try { Set-Content -LiteralPath $stamp -Value '' -NoNewline -ErrorAction Stop } catch { }
         }
@@ -350,8 +360,10 @@ function Invoke-Launcher([string[]]$Arguments) {
         # Retry once: some BuildKit setups intermittently fail to resolve base images.
         & $docker @buildArgs 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) }
         if ($LASTEXITCODE -ne 0) { & $docker @buildArgs 2>&1 | ForEach-Object { [Console]::Error.WriteLine($_) } }
-        if ($LASTEXITCODE -ne 0) { return $LASTEXITCODE }
-        if ($sourceLabel) {
+        if ($LASTEXITCODE -ne 0) {
+            if ($required) { return $LASTEXITCODE }
+            [Console]::Error.WriteLine("$staleWarning (build failed)")
+        } elseif ($sourceLabel) {
             $imageId = (@(& $docker image inspect --format '{{.Id}}' doc-sentinel:local 2>$null) -join '').Trim()
             if ($LASTEXITCODE -eq 0 -and $imageId) {
                 try {
